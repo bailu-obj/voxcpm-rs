@@ -1,0 +1,46 @@
+[package]
+name = "voxcpm-rs"
+version = "0.1.0"
+edition = "2021"
+authors = ["VoxCPM Contributors"]
+license = "Apache-2.0"
+description = "Standalone VoxCPM Text-to-Speech model implementation in Rust"
+keywords = ["tts", "text-to-speech", "audio", "ai", "voxcpm"]
+
+[dependencies]
+candle-core = "0.9.1"
+candle-nn = "0.9.1"
+candle-transformers = "0.9.1"
+candle-flash-attn = { version = "0.9.1", optional = true }
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+
+hound = "3.5"
+realfft = "3.5"
+symphonia = { version = "0.5", features = ["mp3", "wav"] }
+tokenizers = "0.22"
+
+num = "0.4"
+rayon = "1.10"
+dirs = "6.0"
+
+[features]
+default = []
+cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+flash-attn = ["candle-flash-attn"]
+
+[[example]]
+name = "simple_tts"
+path = "examples/simple_tts.rs"
+
+[[example]]
+name = "voice_cloning"
+path = "examples/voice_cloning.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
