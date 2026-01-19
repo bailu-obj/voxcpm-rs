@@ -199,6 +199,10 @@ impl VoxCPMGenerator {
     pub fn save_wav(&self, audio: &Tensor, path: &str) -> Result<()> {
         crate::utils::audio::save_wav(audio, path, self.sample_rate as u32)
     }
+
+    pub fn to_wav(&self, audio: &Tensor) -> Result<Vec<u8>> {
+        crate::utils::audio::to_wav(audio, self.sample_rate as u32)
+    }
 }
 
 /// Find files with specific extension in directory

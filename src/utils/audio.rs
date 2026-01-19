@@ -314,3 +314,29 @@ pub fn save_wav(audio: &Tensor, save_path: &str, sample_rate: u32) -> Result<()>
     writer.finalize()?;
     Ok(())
 }
+
+pub fn to_wav(audio: &Tensor, sample_rate: u32) -> Result<Vec<u8>> {
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+
+    assert_eq!(audio.dim(0)?, 1, "audio channel must be 1");
+    let max = audio.abs()?.max_all()?;
+    let max = max.to_scalar::<f32>()?;
+    let ratio = if max > 1.0 { 32767.0 / max } else { 32767.0 };
+    let audio = audio.squeeze(0)?;
+    let audio_vec = audio.to_vec1::<f32>()?;
+    let mut buffer = Vec::new();
+    let cursor = Cursor::new(&mut buffer);
+    let mut writer = hound::WavWriter::new(cursor, spec).unwrap();
+
+    for i in audio_vec {
+        let sample_i16 = (i * ratio).round() as i16;
+        writer.write_sample(sample_i16)?;
+    }
+    writer.finalize()?;
+    Ok(buffer)
+}
