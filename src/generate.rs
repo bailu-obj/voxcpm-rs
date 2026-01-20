@@ -151,6 +151,14 @@ impl VoxCPMGenerator {
         self.inference(target_text, None, None, 2, 100, 10, 2.0, 6.0)
     }
 
+    /// Simple streaming generation with default parameters
+    pub fn generate_stream_simple(
+        &mut self,
+        target_text: String,
+    ) -> Result<impl Iterator<Item = Result<Tensor>> + '_> {
+        self.inference_stream(target_text, None, None, 2, 100, 10, 2.0, 6.0)
+    }
+
     /// Full inference with all parameters
     ///
     /// # Arguments
@@ -174,6 +182,30 @@ impl VoxCPMGenerator {
         retry_badcase_ratio_threshold: f64,
     ) -> Result<Tensor> {
         self.voxcpm.generate(
+            target_text,
+            prompt_text,
+            prompt_wav_path,
+            min_len,
+            max_len,
+            inference_timesteps,
+            cfg_value,
+            retry_badcase_ratio_threshold,
+        )
+    }
+
+    /// Full streaming inference with all parameters
+    pub fn inference_stream(
+        &mut self,
+        target_text: String,
+        prompt_text: Option<String>,
+        prompt_wav_path: Option<String>,
+        min_len: usize,
+        max_len: usize,
+        inference_timesteps: usize,
+        cfg_value: f64,
+        retry_badcase_ratio_threshold: f64,
+    ) -> Result<impl Iterator<Item = Result<Tensor>> + '_> {
+        self.voxcpm.generate_stream(
             target_text,
             prompt_text,
             prompt_wav_path,
