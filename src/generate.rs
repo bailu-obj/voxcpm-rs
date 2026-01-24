@@ -127,23 +127,23 @@ impl VoxCPMGenerator {
         retry_badcase: bool,
         retry_badcase_ratio_threshold: f64,
     ) -> Result<Tensor> {
-        let audio = match &self.prompt_cache {
+        match self.prompt_cache.take() {
             Some(cache) => {
-                let prompt_cache = cache.clone();
-                self.voxcpm.generate_with_prompt_cache(
+                let audio = self.voxcpm.generate_with_prompt_cache(
                     target_text,
-                    prompt_cache,
+                    cache.clone(),
                     min_len,
                     max_len,
                     inference_timesteps,
                     cfg_value,
                     retry_badcase,
                     retry_badcase_ratio_threshold,
-                )?
+                )?;
+                self.prompt_cache = Some(cache);
+                Ok(audio)
             }
-            None => self.generate_simple(target_text)?,
-        };
-        Ok(audio)
+            None => self.generate_simple(target_text),
+        }
     }
 
     /// Simple generation with default parameters
@@ -155,8 +155,41 @@ impl VoxCPMGenerator {
     pub fn generate_stream_simple(
         &mut self,
         target_text: String,
-    ) -> Result<impl Iterator<Item = Result<Tensor>> + '_> {
-        self.inference_stream(target_text, None, None, 2, 100, 10, 2.0, 6.0)
+    ) -> Result<Box<dyn Iterator<Item = Result<Tensor>> + '_>> {
+        let iter = self.inference_stream(target_text, None, None, 2, 100, 10, 2.0, 6.0)?;
+        Ok(Box::new(iter))
+    }
+
+    pub fn generate_stream_use_prompt_cache(
+        &mut self,
+        target_text: String,
+        min_len: usize,
+        max_len: usize,
+        inference_timesteps: usize,
+        cfg_value: f64,
+        retry_badcase: bool,
+        retry_badcase_ratio_threshold: f64,
+    ) -> Result<Box<dyn Iterator<Item = Result<Tensor>> + '_>> {
+        match self.prompt_cache.take() {
+            Some(cache) => {
+                let iter = self.voxcpm.generate_stream_with_prompt_cache(
+                    target_text,
+                    cache.clone(),
+                    min_len,
+                    max_len,
+                    inference_timesteps,
+                    cfg_value,
+                    retry_badcase,
+                    retry_badcase_ratio_threshold,
+                )?;
+                self.prompt_cache = Some(cache);
+                Ok(Box::new(iter) as Box<dyn Iterator<Item = Result<Tensor>>>)
+            }
+            None => {
+                let iter = self.generate_stream_simple(target_text)?;
+                Ok(Box::new(iter) as Box<dyn Iterator<Item = Result<Tensor>>>)
+            }
+        }
     }
 
     /// Full inference with all parameters
@@ -204,8 +237,8 @@ impl VoxCPMGenerator {
         inference_timesteps: usize,
         cfg_value: f64,
         retry_badcase_ratio_threshold: f64,
-    ) -> Result<impl Iterator<Item = Result<Tensor>> + '_> {
-        self.voxcpm.generate_stream(
+    ) -> Result<Box<dyn Iterator<Item = Result<Tensor>> + '_>> {
+        let iter = self.voxcpm.generate_stream(
             target_text,
             prompt_text,
             prompt_wav_path,
@@ -214,7 +247,8 @@ impl VoxCPMGenerator {
             inference_timesteps,
             cfg_value,
             retry_badcase_ratio_threshold,
-        )
+        )?;
+        Ok(Box::new(iter))
     }
 
     /// Get sample rate

@@ -460,6 +460,105 @@ impl VoxCPMModel {
         })
     }
 
+    fn preprocess_audio_to_feat(&self, wav_path: &str) -> Result<Tensor> {
+        let mut audio = load_audio_with_resample(wav_path, &self.device, Some(self.sample_rate))?;
+        let patch_len = self.patch_size * self.chunk_size;
+        if audio.dim(1)? % patch_len != 0 {
+            audio = audio.pad_with_zeros(D::Minus1, patch_len - audio.dim(1)? % patch_len, 0)?;
+        }
+        let audio_feat = self.audio_vae.encode(&audio, Some(self.sample_rate))?;
+        let audio_feat = audio_feat
+            .reshape((self.audio_vae.latent_dim, (), self.patch_size))?
+            .permute((1, 2, 0))?;
+        Ok(audio_feat)
+    }
+
+    fn prepare_full_inputs(
+        &self,
+        target_text: String,
+        prompt_text: Option<String>,
+        prompt_wav_path: Option<String>,
+        prompt_cache: Option<&HashMap<String, Tensor>>,
+    ) -> Result<(Tensor, Tensor, Tensor, Tensor, usize)> {
+        let (text_token, audio_feat) = if let Some(cache) = prompt_cache {
+            let target_text_token = self.tokenizer.encode(target_text.clone())?;
+            let target_text_token =
+                Tensor::from_slice(&target_text_token, target_text_token.len(), &self.device)?;
+            let text_token = match cache.get("text_token") {
+                Some(token) => Tensor::cat(&[token, &target_text_token], 0)?,
+                None => target_text_token,
+            };
+            (text_token, cache.get("audio_feat").cloned())
+        } else {
+            let encoded_text = if let Some(p_text) = prompt_text {
+                p_text + &target_text
+            } else {
+                target_text.clone()
+            };
+            let text_token = self.tokenizer.encode(encoded_text)?;
+            let text_token = Tensor::from_slice(&text_token, text_token.len(), &self.device)?;
+            let audio_feat = if let Some(path) = prompt_wav_path {
+                Some(self.preprocess_audio_to_feat(&path)?)
+            } else {
+                None
+            };
+            (text_token, audio_feat)
+        };
+
+        let audio_start = Tensor::new(vec![self.audio_start_token as u32], &self.device)?;
+        let text_token = Tensor::cat(&[text_token, audio_start], D::Minus1)?;
+        let text_length = text_token.dim(0)?;
+        let target_text_length = self.tokenizer.encode(target_text)?.len();
+
+        if let Some(feat) = audio_feat {
+            let audio_length = feat.dim(0)?;
+            let text_pad_token = Tensor::zeros(audio_length, DType::U32, &self.device)?;
+            let text_token = Tensor::cat(&[text_token, text_pad_token], D::Minus1)?;
+            let audio_pad_feat = Tensor::zeros(
+                (text_length, self.patch_size, self.audio_vae.latent_dim),
+                feat.dtype(),
+                &self.device,
+            )?;
+            let audio_feat = Tensor::cat(&[audio_pad_feat, feat], 0)?;
+            let text_mask = Tensor::cat(
+                &[
+                    Tensor::ones(text_length, self.dtype, &self.device)?,
+                    Tensor::zeros(audio_length, self.dtype, &self.device)?,
+                ],
+                D::Minus1,
+            )?;
+            let audio_mask = Tensor::cat(
+                &[
+                    Tensor::zeros(text_length, self.dtype, &self.device)?,
+                    Tensor::ones(audio_length, self.dtype, &self.device)?,
+                ],
+                D::Minus1,
+            )?;
+            Ok((
+                text_token,
+                text_mask,
+                audio_feat,
+                audio_mask,
+                target_text_length,
+            ))
+        } else {
+            let audio_feat = Tensor::zeros(
+                (text_length, self.patch_size, self.audio_vae.latent_dim),
+                self.dtype,
+                &self.device,
+            )?;
+            let text_mask = Tensor::ones(text_length, self.dtype, &self.device)?;
+            let audio_mask = Tensor::zeros(text_length, self.dtype, &self.device)?;
+            Ok((
+                text_token,
+                text_mask,
+                audio_feat,
+                audio_mask,
+                target_text_length,
+            ))
+        }
+    }
+
     pub fn generate(
         &mut self,
         target_text: String,
@@ -472,74 +571,8 @@ impl VoxCPMModel {
         // retry_badcase: bool,
         retry_badcase_ratio_threshold: f64,
     ) -> Result<Tensor> {
-        let (text_token, text_mask, audio_feat, audio_mask) = match prompt_wav_path {
-            None => {
-                let text_token = self.tokenizer.encode(target_text.clone())?;
-                let text_token = Tensor::from_slice(&text_token, text_token.len(), &self.device)?;
-                let audio_start = Tensor::new(vec![self.audio_start_token as u32], &self.device)?;
-                let text_token = Tensor::cat(&[text_token, audio_start], D::Minus1)?;
-                let text_length = text_token.dim(0)?;
-                let audio_feat = Tensor::zeros(
-                    (text_length, self.patch_size, self.audio_vae.latent_dim),
-                    DType::F32,
-                    &self.device,
-                )?;
-                let text_mask = Tensor::ones(text_length, self.dtype, &self.device)?;
-                let audio_mask = Tensor::zeros(text_length, self.dtype, &self.device)?;
-                (text_token, text_mask, audio_feat, audio_mask)
-            }
-            Some(path) => {
-                let text = prompt_text.unwrap_or("".to_string()) + &target_text;
-                let text_token = self.tokenizer.encode(text)?;
-                let text_token = Tensor::from_slice(&text_token, text_token.len(), &self.device)?;
-                let audio_start = Tensor::new(vec![self.audio_start_token as u32], &self.device)?;
-                let text_token = Tensor::cat(&[text_token, audio_start], D::Minus1)?;
-                let text_length = text_token.dim(0)?;
-                let mut audio =
-                    load_audio_with_resample(&path, &self.device.clone(), Some(self.sample_rate))?;
-                let patch_len = self.patch_size * self.chunk_size;
-                if audio.dim(1)? % patch_len != 0 {
-                    audio = audio.pad_with_zeros(
-                        D::Minus1,
-                        // 0,
-                        // patch_len - audio.dim(1)? % patch_len,
-                        patch_len - audio.dim(1)? % patch_len,
-                        0,
-                    )?;
-                }
-                let audio_feat = self.audio_vae.encode(&audio, Some(self.sample_rate))?;
-                let audio_feat = audio_feat
-                    .reshape((self.audio_vae.latent_dim, (), self.patch_size))?
-                    .permute((1, 2, 0))?;
-                // let dim0 = audio_feat.dim(0)? - 1;
-                // let audio_feat = audio_feat.i(..dim0)?;
-                let audio_length = audio_feat.dim(0)?;
-                let text_pad_token = Tensor::zeros(audio_length, DType::U32, &self.device)?;
-                let text_token = Tensor::cat(&[text_token, text_pad_token], D::Minus1)?;
-                let audio_pad_feat = Tensor::zeros(
-                    (text_length, self.patch_size, self.audio_vae.latent_dim),
-                    audio_feat.dtype(),
-                    &self.device,
-                )?;
-                let audio_feat = Tensor::cat(&[audio_pad_feat, audio_feat], 0)?;
-                let text_mask = Tensor::cat(
-                    &[
-                        Tensor::ones(text_length, self.dtype, &self.device)?,
-                        Tensor::zeros(audio_length, self.dtype, &self.device)?,
-                    ],
-                    D::Minus1,
-                )?;
-                let audio_mask = Tensor::cat(
-                    &[
-                        Tensor::zeros(text_length, self.dtype, &self.device)?,
-                        Tensor::ones(audio_length, self.dtype, &self.device)?,
-                    ],
-                    D::Minus1,
-                )?;
-                (text_token, text_mask, audio_feat, audio_mask)
-            }
-        };
-        let target_text_length = self.tokenizer.encode(target_text)?.len();
+        let (text_token, text_mask, audio_feat, audio_mask, target_text_length) =
+            self.prepare_full_inputs(target_text, prompt_text, prompt_wav_path, None)?;
         let max_len = max_len
             .min((target_text_length as f64 * retry_badcase_ratio_threshold + 10.0) as usize);
         let decode_audio = self._generate(
@@ -619,7 +652,7 @@ impl VoxCPMModel {
         Ok(VoxCPMGenerateStream {
             inf_stream,
             vae_state: None,
-            all_latents: Vec::new(),
+            skipped_first: false,
             pending_chunk: None,
             finished: false,
         })
@@ -744,74 +777,8 @@ impl VoxCPMModel {
         cfg_value: f64,
         retry_badcase_ratio_threshold: f64,
     ) -> Result<VoxCPMGenerateStream<'_>> {
-        let text_token = self.tokenizer.encode(target_text.clone())?;
-        let text_token = Tensor::from_slice(&text_token, text_token.len(), &self.device)?;
-        let audio_start = Tensor::new(vec![self.audio_start_token as u32], &self.device)?;
-        let text_token = Tensor::cat(&[text_token, audio_start], D::Minus1)?;
-        let text_length = text_token.dim(0)?;
-
-        let (text_token, text_mask, audio_feat, audio_mask) = match (prompt_text, prompt_wav_path) {
-            (None, _) | (_, None) => {
-                let audio_feat = Tensor::zeros(
-                    (text_length, self.patch_size, self.audio_vae.latent_dim),
-                    self.dtype,
-                    &self.device,
-                )?;
-                let text_mask = Tensor::ones(text_length, self.dtype, &self.device)?;
-                let audio_mask = Tensor::zeros(text_length, self.dtype, &self.device)?;
-                (text_token, text_mask, audio_feat, audio_mask)
-            }
-            (Some(prompt_text), Some(prompt_wav_path)) => {
-                let prompt_token = self.tokenizer.encode(prompt_text)?;
-                let prompt_token =
-                    Tensor::from_slice(&prompt_token, prompt_token.len(), &self.device)?;
-                let text_token = Tensor::cat(&[prompt_token, text_token], 0)?;
-                let text_length = text_token.dim(0)?;
-
-                let mut audio = crate::utils::audio::load_audio_with_resample(
-                    &prompt_wav_path,
-                    &self.device.clone(),
-                    Some(self.sample_rate),
-                )?;
-                let patch_len = self.patch_size * self.chunk_size;
-                if audio.dim(1)? % patch_len != 0 {
-                    audio = audio.pad_with_zeros(
-                        D::Minus1,
-                        patch_len - audio.dim(1)? % patch_len,
-                        0,
-                    )?;
-                }
-                let audio_feat = self.audio_vae.encode(&audio, Some(self.sample_rate))?;
-                let audio_feat = audio_feat
-                    .reshape((self.audio_vae.latent_dim, (), self.patch_size))?
-                    .permute((1, 2, 0))?;
-                let audio_length = audio_feat.dim(0)?;
-                let text_pad_token = Tensor::zeros(audio_length, DType::U32, &self.device)?;
-                let text_token = Tensor::cat(&[text_token, text_pad_token], D::Minus1)?;
-                let audio_pad_feat = Tensor::zeros(
-                    (text_length, self.patch_size, self.audio_vae.latent_dim),
-                    audio_feat.dtype(),
-                    &self.device,
-                )?;
-                let audio_feat = Tensor::cat(&[audio_pad_feat, audio_feat], 0)?;
-                let text_mask = Tensor::cat(
-                    &[
-                        Tensor::ones(text_length, self.dtype, &self.device)?,
-                        Tensor::zeros(audio_length, self.dtype, &self.device)?,
-                    ],
-                    D::Minus1,
-                )?;
-                let audio_mask = Tensor::cat(
-                    &[
-                        Tensor::zeros(text_length, self.dtype, &self.device)?,
-                        Tensor::ones(audio_length, self.dtype, &self.device)?,
-                    ],
-                    D::Minus1,
-                )?;
-                (text_token, text_mask, audio_feat, audio_mask)
-            }
-        };
-        let target_text_length = self.tokenizer.encode(target_text)?.len();
+        let (text_token, text_mask, audio_feat, audio_mask, target_text_length) =
+            self.prepare_full_inputs(target_text, prompt_text, prompt_wav_path, None)?;
         let max_len = max_len
             .min((target_text_length as f64 * retry_badcase_ratio_threshold + 10.0) as usize);
 
@@ -979,7 +946,7 @@ impl<'a> Drop for VoxCPMInferenceStream<'a> {
 pub struct VoxCPMGenerateStream<'a> {
     inf_stream: VoxCPMInferenceStream<'a>,
     vae_state: Option<crate::audio_vae::DecoderState>,
-    all_latents: Vec<Tensor>,
+    skipped_first: bool,
     pending_chunk: Option<Tensor>,
     finished: bool,
 }
@@ -1022,9 +989,8 @@ impl<'a> Iterator for VoxCPMGenerateStream<'a> {
                         self.vae_state = Some(state);
                     }
 
-                    self.all_latents.push(latent);
-
-                    if self.all_latents.len() == 1 {
+                    if !self.skipped_first {
+                        self.skipped_first = true;
                         // Latent 0 skipped
                     } else {
                         let audio_chunk = match self.inf_stream.model.audio_vae.decode_stream(
@@ -1060,21 +1026,7 @@ impl VoxCPMModel {
     ) -> Result<HashMap<String, Tensor>> {
         let text_token = self.tokenizer.encode(prompt_text)?;
         let text_token = Tensor::from_slice(&text_token, text_token.len(), &self.device)?;
-        let mut audio = load_audio_with_resample(
-            &prompt_wav_path,
-            &self.device.clone(),
-            Some(self.sample_rate),
-        )?;
-        let patch_len = self.patch_size * self.chunk_size;
-        if audio.dim(1)? % patch_len != 0 {
-            audio = audio.pad_with_zeros(D::Minus1, 0, patch_len - audio.dim(1)? % patch_len)?;
-        }
-        let audio_feat = self.audio_vae.encode(&audio, Some(self.sample_rate))?;
-        let audio_feat = audio_feat
-            .reshape((self.audio_vae.latent_dim, (), self.patch_size))?
-            .permute((1, 2, 0))?;
-        let dim0 = audio_feat.dim(0)? - 1;
-        let audio_feat = audio_feat.i(..dim0)?;
+        let audio_feat = self.preprocess_audio_to_feat(&prompt_wav_path)?;
         let mut hashmap = HashMap::new();
         hashmap.insert("text_token".to_string(), text_token);
         hashmap.insert("audio_feat".to_string(), audio_feat);
@@ -1092,57 +1044,9 @@ impl VoxCPMModel {
         retry_badcase: bool,
         retry_badcase_ratio_threshold: f64,
     ) -> Result<Tensor> {
-        let target_text_token = self.tokenizer.encode(target_text.clone())?;
-        let target_text_token =
-            Tensor::from_slice(&target_text_token, target_text_token.len(), &self.device)?;
-        let text_token = match prompt_cache.get("text_token") {
-            Some(token) => Tensor::cat(&[token, &target_text_token], 0)?,
-            None => target_text_token,
-        };
-        let audio_start = Tensor::new(vec![self.audio_start_token as u32], &self.device)?;
-        let text_token = Tensor::cat(&[text_token, audio_start], D::Minus1)?;
-        let text_length = text_token.dim(0)?;
-        let (audio_length, audio_feat) = match prompt_cache.get("audio_feat") {
-            Some(feat) => (feat.dim(0)?, Some(feat.clone())),
-            None => (0, None),
-        };
-        let (text_token, text_mask, audio_feat, audio_mask) = if audio_length > 0 {
-            let audio_feat = audio_feat.unwrap();
-            let audio_length = audio_feat.dim(0)?;
-            let text_pad_token = Tensor::zeros(audio_length, DType::U32, &self.device)?;
-            let text_token = Tensor::cat(&[text_token, text_pad_token], D::Minus1)?;
-            let audio_pad_feat = Tensor::zeros(
-                (text_length, self.patch_size, self.audio_vae.latent_dim),
-                audio_feat.dtype(),
-                &self.device,
-            )?;
-            let audio_feat = Tensor::cat(&[audio_pad_feat, audio_feat], 0)?;
-            let text_mask = Tensor::cat(
-                &[
-                    Tensor::ones(text_length, self.dtype, &self.device)?,
-                    Tensor::zeros(audio_length, self.dtype, &self.device)?,
-                ],
-                D::Minus1,
-            )?;
-            let audio_mask = Tensor::cat(
-                &[
-                    Tensor::zeros(text_length, self.dtype, &self.device)?,
-                    Tensor::ones(audio_length, self.dtype, &self.device)?,
-                ],
-                D::Minus1,
-            )?;
-            (text_token, text_mask, audio_feat, audio_mask)
-        } else {
-            let audio_feat = Tensor::zeros(
-                (text_length, self.patch_size, self.audio_vae.latent_dim),
-                DType::F32,
-                &self.device,
-            )?;
-            let text_mask = Tensor::ones(text_length, self.dtype, &self.device)?;
-            let audio_mask = Tensor::zeros(text_length, self.dtype, &self.device)?;
-            (text_token, text_mask, audio_feat, audio_mask)
-        };
-        let target_text_length = self.tokenizer.encode(target_text)?.len();
+        let (text_token, text_mask, audio_feat, audio_mask, target_text_length) =
+            self.prepare_full_inputs(target_text, None, None, Some(&prompt_cache))?;
+
         let max_len = if retry_badcase {
             (target_text_length as f64 * retry_badcase_ratio_threshold + 10.0) as usize
         } else {
@@ -1159,5 +1063,36 @@ impl VoxCPMModel {
             cfg_value,
         )?;
         Ok(decode_audio)
+    }
+
+    pub fn generate_stream_with_prompt_cache(
+        &mut self,
+        target_text: String,
+        prompt_cache: HashMap<String, Tensor>,
+        min_len: usize,
+        max_len: usize,
+        inference_timesteps: usize,
+        cfg_value: f64,
+        retry_badcase: bool,
+        retry_badcase_ratio_threshold: f64,
+    ) -> Result<VoxCPMGenerateStream<'_>> {
+        let (text_token, text_mask, audio_feat, audio_mask, target_text_length) =
+            self.prepare_full_inputs(target_text, None, None, Some(&prompt_cache))?;
+
+        let max_len = if retry_badcase {
+            (target_text_length as f64 * retry_badcase_ratio_threshold + 10.0) as usize
+        } else {
+            max_len
+        };
+        self._generate_stream(
+            &text_token,
+            &text_mask,
+            &audio_feat,
+            &audio_mask,
+            min_len,
+            max_len,
+            inference_timesteps,
+            cfg_value,
+        )
     }
 }

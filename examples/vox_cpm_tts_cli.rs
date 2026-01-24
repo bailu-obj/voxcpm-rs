@@ -1,6 +1,6 @@
 use anyhow::{bail, Result};
+use candle_core::Tensor;
 use clap::Parser;
-use core::time;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
@@ -33,6 +33,10 @@ struct Args {
     /// Output prefix
     #[arg(long, default_value = "output")]
     out: String,
+
+    /// Enable streaming TTS (no-ref only)
+    #[arg(long, default_value = "false")]
+    stream: bool,
 }
 
 fn main() -> Result<()> {
@@ -60,55 +64,132 @@ fn main() -> Result<()> {
         }
     };
 
-    // --------------------------------------------------
-    // 🔹 Inference loop (NO cache init here)
-    // --------------------------------------------------
-    let mut total_time_cost = 0.0f64;
-    let mut total_audio_time = 0.0f64;
-    for (i, text) in texts.iter().enumerate() {
-        println!("▶ Generating {}/{}", i + 1, texts.len());
-        let start = Instant::now();
-        let tensor = if use_ref {
-            generator.generate_use_prompt_cache(
-                text.clone(),
-                5,    // min_len
-                500,  // max_len
-                15,   // timesteps
-                2.5,  // cfg
-                true, // use cache
-                6.0,  // retry threshold
-            )?
-        } else {
-            generator.generate_simple(text.clone())?
-        };
+    if args.stream {
+        // --------------------------------------------------
+        // 🔹 Inference loop (NO cache init here)
+        // --------------------------------------------------
+        let mut total_time_cost = 0.0f64;
+        let mut total_audio_time = 0.0f64;
+        for (i, text) in texts.iter().enumerate() {
+            println!("▶ Generating (streaming) {}/{}", i + 1, texts.len());
+            let start = Instant::now();
+            let mut first_chunk_time = None;
 
-        let wav = generator.to_wav(&tensor)?;
-        let text_prefix = substring_by_char_count(text, 0, 4);
+            let stream: Box<dyn Iterator<Item = Result<Tensor>> + '_> = if use_ref {
+                Box::new(generator.generate_stream_use_prompt_cache(
+                    text.clone(),
+                    5,    // min_len
+                    500,  // max_len
+                    15,   // timesteps
+                    2.5,  // cfg
+                    true, // use cache
+                    6.0,  // retry threshold
+                )?)
+            } else {
+                Box::new(generator.generate_stream_simple(text.clone())?)
+            };
 
-        let time_cost = start.elapsed().as_secs_f64();
-        let audio_len = wav.len() as f64 / 44100.0 / 2.0;
+            let mut chunks = Vec::new();
+            for (_chunk_idx, chunk_res) in stream.enumerate() {
+                let chunk = chunk_res?;
+                if first_chunk_time.is_none() {
+                    first_chunk_time = Some(start.elapsed().as_secs_f64());
+                    println!(
+                        "  ↳ First chunk generated in {:.2}s",
+                        first_chunk_time.unwrap()
+                    );
+                }
+                chunks.push(chunk);
+                print!(".");
+                use std::io::Write;
+                std::io::stdout().flush()?;
+            }
+            println!();
 
-        total_audio_time += audio_len;
-        total_time_cost += time_cost;
+            if chunks.is_empty() {
+                println!("! No audio generated for text: {}", text);
+                continue;
+            }
 
-        let rtf = time_cost / audio_len;
+            let tensor = Tensor::cat(&chunks, 1)?;
+            let wav = generator.to_wav(&tensor)?;
+            let text_prefix = substring_by_char_count(text, 0, 4);
+
+            let time_cost = start.elapsed().as_secs_f64();
+            let audio_len = wav.len() as f64 / generator.sample_rate() as f64 / 2.0;
+
+            total_audio_time += audio_len;
+            total_time_cost += time_cost;
+
+            let rtf = time_cost / audio_len;
+            println!(
+                "✓ Streaming finished for text {}... , using {:.2} seconds, output {:.2} seconds, rtf {:.2}\n",
+                text_prefix, time_cost, audio_len, rtf,
+            );
+            let output = format!("{}_{}_stream.wav", args.out, i + 1);
+            std::fs::write(&output, wav)?;
+            println!("✓ Saved {}\n", output);
+        }
         println!(
+            "Average time cost: {:.2} seconds",
+            total_time_cost / texts.len() as f64
+        );
+        println!(
+            "Average audio time: {:.2} seconds",
+            total_audio_time / texts.len() as f64
+        );
+        println!("Average rtf: {:.2}", total_time_cost / total_audio_time);
+    } else {
+        // --------------------------------------------------
+        // 🔹 Inference loop (NO cache init here)
+        // --------------------------------------------------
+        let mut total_time_cost = 0.0f64;
+        let mut total_audio_time = 0.0f64;
+        for (i, text) in texts.iter().enumerate() {
+            println!("▶ Generating {}/{}", i + 1, texts.len());
+            let start = Instant::now();
+            let tensor = if use_ref {
+                generator.generate_use_prompt_cache(
+                    text.clone(),
+                    5,    // min_len
+                    500,  // max_len
+                    15,   // timesteps
+                    2.5,  // cfg
+                    true, // use cache
+                    6.0,  // retry threshold
+                )?
+            } else {
+                generator.generate_simple(text.clone())?
+            };
+
+            let wav = generator.to_wav(&tensor)?;
+            let text_prefix = substring_by_char_count(text, 0, 4);
+
+            let time_cost = start.elapsed().as_secs_f64();
+            let audio_len = wav.len() as f64 / generator.sample_rate() as f64 / 2.0;
+
+            total_audio_time += audio_len;
+            total_time_cost += time_cost;
+
+            let rtf = time_cost / audio_len;
+            println!(
             "✓ Generated for text {}... , using {:.2} seconds, output {:.2} seconds, rtf {:.2}\n",
             text_prefix, time_cost, audio_len, rtf,
         );
-        let output = format!("{}_{}.wav", args.out, i + 1);
-        std::fs::write(&output, wav)?;
-        println!("✓ Saved {}\n", output);
+            let output = format!("{}_{}.wav", args.out, i + 1);
+            std::fs::write(&output, wav)?;
+            println!("✓ Saved {}\n", output);
+        }
+        println!(
+            "Average time cost: {:.2} seconds",
+            total_time_cost / texts.len() as f64
+        );
+        println!(
+            "Average audio time: {:.2} seconds",
+            total_audio_time / texts.len() as f64
+        );
+        println!("Average rtf: {:.2}", total_time_cost / total_audio_time);
     }
-    println!(
-        "Average time cost: {:.2} seconds",
-        total_time_cost / texts.len() as f64
-    );
-    println!(
-        "Average audio time: {:.2} seconds",
-        total_audio_time / texts.len() as f64
-    );
-    println!("Average rtf: {:.2}", total_time_cost / total_audio_time);
 
     Ok(())
 }
