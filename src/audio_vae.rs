@@ -1,5 +1,5 @@
 use anyhow::{Ok, Result};
-use candle_core::{D, Tensor};
+use candle_core::{DType, Device, Tensor, D};
 use candle_nn::{Conv1d, Conv1dConfig, ConvTranspose1d, ConvTranspose1dConfig, Module, VarBuilder};
 
 pub struct CausalConv1d {
@@ -32,6 +32,26 @@ impl CausalConv1d {
         let x_pad = x.pad_with_zeros(D::Minus1, self.padding * 2, 0)?;
         let x = self.conv1d.forward(&x_pad)?;
         Ok(x)
+    }
+
+    pub fn forward_stream(&self, x: &Tensor, state: &mut Tensor) -> Result<Tensor> {
+        // x: [B, C, L]
+        // state: [B, C, P*2]
+        let x_pad = Tensor::cat(&[state as &Tensor, x], D::Minus1)?;
+        let x_out = self.conv1d.forward(&x_pad)?;
+        *state = x_pad.narrow(D::Minus1, x.dim(D::Minus1)?, state.dim(D::Minus1)?)?;
+        Ok(x_out)
+    }
+
+    pub fn init_state(&self, batch_size: usize, device: &Device, dtype: DType) -> Result<Tensor> {
+        let in_channels = self.conv1d.weight().dim(1)?;
+        let groups = self.conv1d.config().groups;
+        let t = Tensor::zeros(
+            (batch_size, in_channels * groups, self.padding * 2),
+            dtype,
+            device,
+        )?;
+        Ok(t)
     }
 }
 
@@ -78,6 +98,47 @@ impl CausalConvTranspose1d {
         let x = x.narrow(D::Minus1, 0, select_num)?;
         Ok(x)
     }
+
+    pub fn forward_stream(&self, x: &Tensor, state: &mut Tensor) -> Result<Tensor> {
+        // x: [B, C, L]
+        // state: [B, C, K-S] overlap buffer
+        let x_out = self.conv_transpose1d.forward(x)?;
+        let kernel_size = self.conv_transpose1d.weight().dim(2)?;
+        let stride = self.conv_transpose1d.config().stride;
+        let overlap_len = kernel_size - stride;
+        let out_len = x_out.dim(D::Minus1)?;
+        let select_num = out_len.saturating_sub(overlap_len);
+
+        let mut out = x_out.narrow(D::Minus1, 0, select_num)?;
+        if overlap_len > 0 {
+            let add_len = overlap_len.min(select_num);
+            let a = out.narrow(D::Minus1, 0, add_len)?;
+            let b = state.narrow(D::Minus1, 0, add_len)?;
+            let sum = a.add(&b)?;
+            if select_num > add_len {
+                out = Tensor::cat(
+                    &[&sum, &out.narrow(D::Minus1, add_len, select_num - add_len)?],
+                    D::Minus1,
+                )?;
+            } else {
+                out = sum;
+            }
+        }
+        *state = x_out.narrow(D::Minus1, select_num, out_len - select_num)?;
+        Ok(out)
+    }
+
+    pub fn init_state(&self, batch_size: usize, device: &Device, dtype: DType) -> Result<Tensor> {
+        let out_channels = self.conv_transpose1d.weight().dim(1)?;
+        let kernel_size = self.conv_transpose1d.weight().dim(2)?;
+        let stride = self.conv_transpose1d.config().stride;
+        let t = Tensor::zeros(
+            (batch_size, out_channels, kernel_size - stride),
+            dtype,
+            device,
+        )?;
+        Ok(t)
+    }
 }
 
 pub struct WNCausalConv1d {
@@ -107,6 +168,12 @@ impl WNCausalConv1d {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let x = self.conv.forward(x)?;
         Ok(x)
+    }
+    pub fn forward_stream(&self, x: &Tensor, state: &mut Tensor) -> Result<Tensor> {
+        self.conv.forward_stream(x, state)
+    }
+    pub fn init_state(&self, batch_size: usize, device: &Device, dtype: DType) -> Result<Tensor> {
+        self.conv.init_state(batch_size, device, dtype)
     }
 }
 
@@ -147,6 +214,12 @@ impl WNCausalConvTranspose1d {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let x = self.conv_transpose.forward(x)?;
         Ok(x)
+    }
+    pub fn forward_stream(&self, x: &Tensor, state: &mut Tensor) -> Result<Tensor> {
+        self.conv_transpose.forward_stream(x, state)
+    }
+    pub fn init_state(&self, batch_size: usize, device: &Device, dtype: DType) -> Result<Tensor> {
+        self.conv_transpose.init_state(batch_size, device, dtype)
     }
 }
 
@@ -222,6 +295,28 @@ impl CausalResidualUnit {
         }
         let x = y.add(&res_x)?;
         Ok(x)
+    }
+
+    pub fn forward_stream(&self, x: &Tensor, states: &mut Vec<Tensor>) -> Result<Tensor> {
+        let res_x = x.clone();
+        let y = self.block0.forward(x)?;
+        let y = self.block1.forward_stream(&y, &mut states[0])?;
+        let y = self.block2.forward(&y)?;
+        let y = self.block3.forward_stream(&y, &mut states[1])?;
+        let x = y.add(&res_x)?;
+        Ok(x)
+    }
+
+    pub fn init_states(
+        &self,
+        batch_size: usize,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Vec<Tensor>> {
+        Ok(vec![
+            self.block1.init_state(batch_size, device, dtype)?,
+            self.block3.init_state(batch_size, device, dtype)?,
+        ])
     }
 }
 
@@ -396,6 +491,29 @@ impl CausalDecoderBlock {
         let x = self.block4.forward(&x)?;
         Ok(x)
     }
+
+    pub fn forward_stream(&self, x: &Tensor, states: &mut DecoderBlockState) -> Result<Tensor> {
+        let x = self.block0.forward(x)?;
+        let x = self.block1.forward_stream(&x, &mut states[0][0])?;
+        let x = self.block2.forward_stream(&x, &mut states[1])?;
+        let x = self.block3.forward_stream(&x, &mut states[2])?;
+        let x = self.block4.forward_stream(&x, &mut states[3])?;
+        Ok(x)
+    }
+
+    pub fn init_states(
+        &self,
+        batch_size: usize,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<DecoderBlockState> {
+        Ok(vec![
+            vec![self.block1.init_state(batch_size, device, dtype)?],
+            self.block2.init_states(batch_size, device, dtype)?,
+            self.block3.init_states(batch_size, device, dtype)?,
+            self.block4.init_states(batch_size, device, dtype)?,
+        ])
+    }
 }
 
 pub struct CausalDecoder {
@@ -466,7 +584,48 @@ impl CausalDecoder {
         let x = x.tanh()?;
         Ok(x)
     }
+
+    pub fn forward_stream(&self, x: &Tensor, state: &mut DecoderState) -> Result<Tensor> {
+        let mut x = self.model0.forward_stream(x, &mut state.model0_state)?;
+        x = self.model1.forward_stream(&x, &mut state.model1_state)?;
+        for (i, model_i) in self.models.iter().enumerate() {
+            x = model_i.forward_stream(&x, &mut state.block_states[i])?;
+        }
+        x = self.model_minus_2.forward(&x)?;
+        x = self
+            .model_minus_1
+            .forward_stream(&x, &mut state.model_minus_1_state)?;
+        x = x.tanh()?;
+        Ok(x)
+    }
+
+    pub fn init_state(
+        &self,
+        batch_size: usize,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<DecoderState> {
+        let mut block_states = Vec::new();
+        for model_i in &self.models {
+            block_states.push(model_i.init_states(batch_size, device, dtype)?);
+        }
+        Ok(DecoderState {
+            model0_state: self.model0.init_state(batch_size, device, dtype)?,
+            model1_state: self.model1.init_state(batch_size, device, dtype)?,
+            block_states,
+            model_minus_1_state: self.model_minus_1.init_state(batch_size, device, dtype)?,
+        })
+    }
 }
+
+pub struct DecoderState {
+    pub model0_state: Tensor,
+    pub model1_state: Tensor,
+    pub block_states: Vec<DecoderBlockState>,
+    pub model_minus_1_state: Tensor,
+}
+
+pub type DecoderBlockState = Vec<Vec<Tensor>>; // [block1, block2, block3] states
 
 pub struct AudioVAE {
     // encoder_dim: usize,
@@ -542,6 +701,20 @@ impl AudioVAE {
     pub fn decode(&self, z: &Tensor) -> Result<Tensor> {
         let x = self.decoder.forward(z)?;
         Ok(x)
+    }
+
+    pub fn decode_stream(&self, z: &Tensor, state: &mut DecoderState) -> Result<Tensor> {
+        let x = self.decoder.forward_stream(z, state)?;
+        Ok(x)
+    }
+
+    pub fn init_decoder_state(
+        &self,
+        batch_size: usize,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<DecoderState> {
+        self.decoder.init_state(batch_size, device, dtype)
     }
 
     pub fn encode(&self, audio_data: &Tensor, sample_rate: Option<usize>) -> Result<Tensor> {

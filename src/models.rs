@@ -1,4 +1,4 @@
-use anyhow::{Ok, Result};
+use anyhow::Result;
 use candle_core::{DType, Device, IndexOp, Tensor, D};
 use candle_nn::{linear, linear_no_bias, Linear, Module, VarBuilder};
 use candle_transformers::models::deepseek2::SplitOp;
@@ -590,6 +590,41 @@ impl VoxCPMModel {
         Ok(decode_audio)
     }
 
+    fn _generate_stream(
+        &mut self,
+        text_token: &Tensor,
+        text_mask: &Tensor,
+        audio_feat: &Tensor,
+        audio_mask: &Tensor,
+        min_len: usize,
+        max_len: usize,
+        inference_timesteps: usize,
+        cfg_value: f64,
+    ) -> Result<VoxCPMGenerateStream<'_>> {
+        let text_token = text_token.unsqueeze(0)?;
+        let text_mask = text_mask.unsqueeze(0)?;
+        let audio_feat = audio_feat.unsqueeze(0)?.to_dtype(self.dtype)?;
+        let audio_mask = audio_mask.unsqueeze(0)?;
+        let inf_stream = self.inference_stream(
+            &text_token,
+            &text_mask,
+            &audio_feat,
+            &audio_mask,
+            min_len,
+            max_len,
+            inference_timesteps,
+            cfg_value,
+        )?;
+
+        Ok(VoxCPMGenerateStream {
+            inf_stream,
+            vae_state: None,
+            all_latents: Vec::new(),
+            pending_chunk: None,
+            finished: false,
+        })
+    }
+
     fn inference(
         &mut self,
         text: &Tensor,
@@ -601,6 +636,45 @@ impl VoxCPMModel {
         inference_timesteps: usize,
         cfg_value: f64,
     ) -> Result<Tensor> {
+        let mut pred_feat_seq = Vec::new();
+        self.inference_stream(
+            text,
+            text_mask,
+            feat,
+            feat_mask,
+            min_len,
+            max_len,
+            inference_timesteps,
+            cfg_value,
+        )?
+        .for_each(|chunk| {
+            if let Ok(feat) = chunk {
+                pred_feat_seq.push(feat);
+            }
+        });
+
+        let pred_seq = Tensor::cat(&pred_feat_seq, 1)?; // (b, t, p, d)
+        let (b, _, _, d) = pred_seq.dims4()?;
+        let feat_pred = pred_seq
+            .permute((0, 3, 1, 2))?
+            .reshape((b, d, ()))?
+            .contiguous()?;
+        self.base_lm.clear_kv_cache();
+        self.residual_lm.clear_kv_cache();
+        Ok(feat_pred)
+    }
+
+    pub fn inference_stream(
+        &mut self,
+        text: &Tensor,
+        text_mask: &Tensor,
+        feat: &Tensor,
+        feat_mask: &Tensor,
+        min_len: usize,
+        max_len: usize,
+        inference_timesteps: usize,
+        cfg_value: f64,
+    ) -> Result<VoxCPMInferenceStream<'_>> {
         let (_, t, _, _) = feat.dims4()?;
         let feat_embed = self.feat_encoder.forward(feat)?; // [b, t, h_feat]
         let feat_embed = self.enc_to_lm_proj.forward(&feat_embed)?;
@@ -621,10 +695,10 @@ impl VoxCPMModel {
             .unsqueeze(D::Minus1)?
             .broadcast_mul(&text_embed)?
             .add(&feat_mask.unsqueeze(D::Minus1)?.broadcast_mul(&feat_embed)?)?;
-        let mut prefix_feat_cond = feat.i((.., t - 1, ..))?;
-        let mut pred_feat_seq = Vec::new();
-        let mut position_id = 0;
-        let mut seq_len = t;
+        let prefix_feat_cond = feat.i((.., t - 1, ..))?;
+
+        let position_id = 0;
+        let seq_len = t;
         let enc_outputs = self
             .base_lm
             .forward_with_cache(&combined_embed, position_id)?;
@@ -634,71 +708,351 @@ impl VoxCPMModel {
             .broadcast_mul(&feat_mask.unsqueeze(D::Minus1)?)?
             .add(&enc_outputs.broadcast_mul(&text_mask.unsqueeze(D::Minus1)?)?)?;
 
-        let mut lm_hidden = enc_outputs.i((.., t - 1, ..))?;
+        let lm_hidden = enc_outputs.i((.., t - 1, ..))?;
 
         let input_embeds =
             enc_outputs.add(&feat_mask.unsqueeze(D::Minus1)?.broadcast_mul(&feat_embed)?)?;
         let residual_enc_outputs = self
             .residual_lm
             .forward_with_cache(&input_embeds, position_id)?;
-        let mut residual_hidden = residual_enc_outputs.i((.., t - 1, ..))?;
+        let residual_hidden = residual_enc_outputs.i((.., t - 1, ..))?;
 
-        for i in 0..max_len {
-            let dit_hidden_1 = self.lm_to_dit_proj.forward(&lm_hidden)?; // [b, h_dit]
-            let dit_hidden_2 = self.res_to_dit_proj.forward(&residual_hidden)?; // [b, h_dit]
-            let dit_hidden = dit_hidden_1.add(&dit_hidden_2)?;
-            let cond = prefix_feat_cond.transpose(1, 2)?.contiguous()?;
-            let pred_feat = self
-                .feat_decoder
-                .forward(
-                    &dit_hidden,
-                    inference_timesteps,
-                    self.patch_size,
-                    &cond,
-                    1.0,
-                    cfg_value,
-                    1.0,
-                    true,
-                )?
-                .transpose(1, 2)?; // [b, p, d]
-            let curr_embed = self.feat_encoder.forward(&pred_feat.unsqueeze(1)?)?; // [b, 1, c]
-            let curr_embed = self.enc_to_lm_proj.forward(&curr_embed)?;
-            pred_feat_seq.push(pred_feat.unsqueeze(1)?);
-
-            prefix_feat_cond = pred_feat;
-            let stop_flag = self.stop_proj.forward(&lm_hidden)?.silu()?;
-            let stop_flag = self
-                .stop_head
-                .forward(&stop_flag)?
-                .argmax(D::Minus1)?
-                .i(0)?
-                .to_scalar::<u32>()?;
-            if i > min_len && stop_flag == 1 {
-                break;
-            }
-            position_id += seq_len;
-            seq_len = 1;
-            lm_hidden = self
-                .base_lm
-                .forward_with_cache(&curr_embed.i((.., 0, ..))?, position_id)?
-                .squeeze(1)?;
-            lm_hidden = self.fsq_layer.forward(&lm_hidden)?;
-            residual_hidden = self
-                .residual_lm
-                .forward_with_cache(&lm_hidden.add(&curr_embed.i((.., 0, ..))?)?, position_id)?
-                .squeeze(1)?;
-        }
-        let pred_seq = Tensor::cat(&pred_feat_seq, 1)?; // (b, t, p, d)
-        let (b, _, _, d) = pred_seq.dims4()?;
-        let feat_pred = pred_seq
-            .permute((0, 3, 1, 2))?
-            .reshape((b, d, ()))?
-            .contiguous()?;
-        self.base_lm.clear_kv_cache();
-        self.residual_lm.clear_kv_cache();
-        Ok(feat_pred)
+        Ok(VoxCPMInferenceStream {
+            model: self,
+            lm_hidden,
+            residual_hidden,
+            prefix_feat_cond,
+            position_id,
+            seq_len,
+            i: 0,
+            max_len,
+            min_len,
+            inference_timesteps,
+            cfg_value,
+            finished: false,
+        })
     }
 
+    pub fn generate_stream(
+        &mut self,
+        target_text: String,
+        prompt_text: Option<String>,
+        prompt_wav_path: Option<String>,
+        min_len: usize,
+        max_len: usize,
+        inference_timesteps: usize,
+        cfg_value: f64,
+        retry_badcase_ratio_threshold: f64,
+    ) -> Result<VoxCPMGenerateStream<'_>> {
+        let text_token = self.tokenizer.encode(target_text.clone())?;
+        let text_token = Tensor::from_slice(&text_token, text_token.len(), &self.device)?;
+        let audio_start = Tensor::new(vec![self.audio_start_token as u32], &self.device)?;
+        let text_token = Tensor::cat(&[text_token, audio_start], D::Minus1)?;
+        let text_length = text_token.dim(0)?;
+
+        let (text_token, text_mask, audio_feat, audio_mask) = match (prompt_text, prompt_wav_path) {
+            (None, _) | (_, None) => {
+                let audio_feat = Tensor::zeros(
+                    (text_length, self.patch_size, self.audio_vae.latent_dim),
+                    self.dtype,
+                    &self.device,
+                )?;
+                let text_mask = Tensor::ones(text_length, self.dtype, &self.device)?;
+                let audio_mask = Tensor::zeros(text_length, self.dtype, &self.device)?;
+                (text_token, text_mask, audio_feat, audio_mask)
+            }
+            (Some(prompt_text), Some(prompt_wav_path)) => {
+                let prompt_token = self.tokenizer.encode(prompt_text)?;
+                let prompt_token =
+                    Tensor::from_slice(&prompt_token, prompt_token.len(), &self.device)?;
+                let text_token = Tensor::cat(&[prompt_token, text_token], 0)?;
+                let text_length = text_token.dim(0)?;
+
+                let mut audio = crate::utils::audio::load_audio_with_resample(
+                    &prompt_wav_path,
+                    &self.device.clone(),
+                    Some(self.sample_rate),
+                )?;
+                let patch_len = self.patch_size * self.chunk_size;
+                if audio.dim(1)? % patch_len != 0 {
+                    audio = audio.pad_with_zeros(
+                        D::Minus1,
+                        patch_len - audio.dim(1)? % patch_len,
+                        0,
+                    )?;
+                }
+                let audio_feat = self.audio_vae.encode(&audio, Some(self.sample_rate))?;
+                let audio_feat = audio_feat
+                    .reshape((self.audio_vae.latent_dim, (), self.patch_size))?
+                    .permute((1, 2, 0))?;
+                let audio_length = audio_feat.dim(0)?;
+                let text_pad_token = Tensor::zeros(audio_length, DType::U32, &self.device)?;
+                let text_token = Tensor::cat(&[text_token, text_pad_token], D::Minus1)?;
+                let audio_pad_feat = Tensor::zeros(
+                    (text_length, self.patch_size, self.audio_vae.latent_dim),
+                    audio_feat.dtype(),
+                    &self.device,
+                )?;
+                let audio_feat = Tensor::cat(&[audio_pad_feat, audio_feat], 0)?;
+                let text_mask = Tensor::cat(
+                    &[
+                        Tensor::ones(text_length, self.dtype, &self.device)?,
+                        Tensor::zeros(audio_length, self.dtype, &self.device)?,
+                    ],
+                    D::Minus1,
+                )?;
+                let audio_mask = Tensor::cat(
+                    &[
+                        Tensor::zeros(text_length, self.dtype, &self.device)?,
+                        Tensor::ones(audio_length, self.dtype, &self.device)?,
+                    ],
+                    D::Minus1,
+                )?;
+                (text_token, text_mask, audio_feat, audio_mask)
+            }
+        };
+        let target_text_length = self.tokenizer.encode(target_text)?.len();
+        let max_len = max_len
+            .min((target_text_length as f64 * retry_badcase_ratio_threshold + 10.0) as usize);
+
+        self._generate_stream(
+            &text_token,
+            &text_mask,
+            &audio_feat,
+            &audio_mask,
+            min_len,
+            max_len,
+            inference_timesteps,
+            cfg_value,
+        )
+    }
+}
+
+pub struct VoxCPMInferenceStream<'a> {
+    model: &'a mut VoxCPMModel,
+    lm_hidden: Tensor,
+    residual_hidden: Tensor,
+    prefix_feat_cond: Tensor,
+    position_id: usize,
+    seq_len: usize,
+    i: usize,
+    max_len: usize,
+    min_len: usize,
+    inference_timesteps: usize,
+    cfg_value: f64,
+    finished: bool,
+}
+
+impl<'a> Iterator for VoxCPMInferenceStream<'a> {
+    type Item = Result<Tensor>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished || self.i >= self.max_len {
+            return None;
+        }
+
+        let dit_hidden_1 = match self.model.lm_to_dit_proj.forward(&self.lm_hidden) {
+            Ok(t) => t,
+            Err(e) => return Some(Err(e.into())),
+        };
+        let dit_hidden_2 = match self.model.res_to_dit_proj.forward(&self.residual_hidden) {
+            Ok(t) => t,
+            Err(e) => return Some(Err(e.into())),
+        };
+        let dit_hidden = match dit_hidden_1.add(&dit_hidden_2) {
+            Ok(t) => t,
+            Err(e) => return Some(Err(e.into())),
+        };
+        let cond = match self.prefix_feat_cond.transpose(1, 2) {
+            Ok(t) => match t.contiguous() {
+                Ok(t) => t,
+                Err(e) => return Some(Err(e.into())),
+            },
+            Err(e) => return Some(Err(e.into())),
+        };
+
+        let pred_feat = match self.model.feat_decoder.forward(
+            &dit_hidden,
+            self.inference_timesteps,
+            self.model.patch_size,
+            &cond,
+            1.0,
+            self.cfg_value,
+            1.0,
+            true,
+        ) {
+            Ok(t) => match t.transpose(1, 2) {
+                Ok(t) => t,
+                Err(e) => return Some(Err(e.into())),
+            },
+            Err(e) => return Some(Err(e.into())),
+        };
+
+        let pred_feat_unsqueezed = match pred_feat.unsqueeze(1) {
+            Ok(t) => t,
+            Err(e) => return Some(Err(e.into())),
+        };
+
+        let curr_embed = match self.model.feat_encoder.forward(&pred_feat_unsqueezed) {
+            Ok(t) => match self.model.enc_to_lm_proj.forward(&t) {
+                Ok(t) => t,
+                Err(e) => return Some(Err(e.into())),
+            },
+            Err(e) => return Some(Err(e.into())),
+        };
+
+        self.prefix_feat_cond = pred_feat;
+        let stop_flag = match self.model.stop_proj.forward(&self.lm_hidden) {
+            Ok(t) => match t.silu() {
+                Ok(t) => match self.model.stop_head.forward(&t) {
+                    Ok(t) => match t.argmax(D::Minus1) {
+                        Ok(t) => match t.i(0) {
+                            Ok(t) => match t.to_scalar::<u32>() {
+                                Ok(v) => v,
+                                Err(e) => return Some(Err(e.into())),
+                            },
+                            Err(e) => return Some(Err(e.into())),
+                        },
+                        Err(e) => return Some(Err(e.into())),
+                    },
+                    Err(e) => return Some(Err(e.into())),
+                },
+                Err(e) => return Some(Err(e.into())),
+            },
+            Err(e) => return Some(Err(e.into())),
+        };
+
+        if self.i > self.min_len && stop_flag == 1 {
+            self.finished = true;
+        }
+
+        self.position_id += self.seq_len;
+        self.seq_len = 1;
+
+        let curr_embed_val = match curr_embed.i((.., 0, ..)) {
+            Ok(t) => t,
+            Err(e) => return Some(Err(e.into())),
+        };
+
+        self.lm_hidden = match self
+            .model
+            .base_lm
+            .forward_with_cache(&curr_embed_val, self.position_id)
+        {
+            Ok(t) => match t.squeeze(1) {
+                Ok(t) => match self.model.fsq_layer.forward(&t) {
+                    Ok(t) => t,
+                    Err(e) => return Some(Err(e.into())),
+                },
+                Err(e) => return Some(Err(e.into())),
+            },
+            Err(e) => return Some(Err(e.into())),
+        };
+
+        self.residual_hidden = match self.lm_hidden.add(&curr_embed_val) {
+            Ok(t) => match self
+                .model
+                .residual_lm
+                .forward_with_cache(&t, self.position_id)
+            {
+                Ok(t) => match t.squeeze(1) {
+                    Ok(t) => t,
+                    Err(e) => return Some(Err(e.into())),
+                },
+                Err(e) => return Some(Err(e.into())),
+            },
+            Err(e) => return Some(Err(e.into())),
+        };
+
+        self.i += 1;
+        Some(Ok(pred_feat_unsqueezed))
+    }
+}
+
+impl<'a> Drop for VoxCPMInferenceStream<'a> {
+    fn drop(&mut self) {
+        self.model.base_lm.clear_kv_cache();
+        self.model.residual_lm.clear_kv_cache();
+    }
+}
+
+pub struct VoxCPMGenerateStream<'a> {
+    inf_stream: VoxCPMInferenceStream<'a>,
+    vae_state: Option<crate::audio_vae::DecoderState>,
+    all_latents: Vec<Tensor>,
+    pending_chunk: Option<Tensor>,
+    finished: bool,
+}
+
+impl<'a> Iterator for VoxCPMGenerateStream<'a> {
+    type Item = Result<Tensor>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+
+        while let Some(next_latent) = self.inf_stream.next() {
+            match next_latent {
+                Ok(latent) => {
+                    // latent: [B, 1, P, D]
+                    let (b, _, p, d) = match latent.dims4() {
+                        Ok(dims) => dims,
+                        Err(e) => return Some(Err(e.into())),
+                    };
+
+                    // Reshape to [B, D, P] for VAE
+                    let latent_vae = match latent
+                        .permute((0, 3, 1, 2))
+                        .and_then(|t| t.reshape((b, d, p)))
+                    {
+                        Ok(t) => t,
+                        Err(e) => return Some(Err(e.into())),
+                    };
+
+                    if self.vae_state.is_none() {
+                        let state = match self.inf_stream.model.audio_vae.init_decoder_state(
+                            b,
+                            &latent.device(),
+                            DType::F32,
+                        ) {
+                            Ok(s) => s,
+                            Err(e) => return Some(Err(e.into())),
+                        };
+                        self.vae_state = Some(state);
+                    }
+
+                    self.all_latents.push(latent);
+
+                    if self.all_latents.len() == 1 {
+                        // Latent 0 skipped
+                    } else {
+                        let audio_chunk = match self.inf_stream.model.audio_vae.decode_stream(
+                            &latent_vae.to_dtype(DType::F32).unwrap(),
+                            self.vae_state.as_mut().unwrap(),
+                        ) {
+                            Ok(t) => match t.squeeze(1) {
+                                Ok(t) => t,
+                                Err(e) => return Some(Err(e.into())),
+                            },
+                            Err(e) => return Some(Err(e.into())),
+                        };
+
+                        if let Some(to_yield) = self.pending_chunk.replace(audio_chunk) {
+                            return Some(Ok(to_yield));
+                        }
+                    }
+                }
+                Err(e) => return Some(Err(e)),
+            }
+        }
+
+        self.finished = true;
+        None
+    }
+}
+
+impl VoxCPMModel {
     pub fn build_prompt_cache(
         &mut self,
         prompt_text: String,
