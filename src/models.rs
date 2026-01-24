@@ -618,8 +618,9 @@ impl VoxCPMModel {
 
         Ok(VoxCPMGenerateStream {
             inf_stream,
+            vae_state: None,
             all_latents: Vec::new(),
-            yielded_len: 0,
+            pending_chunk: None,
             finished: false,
         })
     }
@@ -977,8 +978,9 @@ impl<'a> Drop for VoxCPMInferenceStream<'a> {
 
 pub struct VoxCPMGenerateStream<'a> {
     inf_stream: VoxCPMInferenceStream<'a>,
+    vae_state: Option<crate::audio_vae::DecoderState>,
     all_latents: Vec<Tensor>,
-    yielded_len: usize,
+    pending_chunk: Option<Tensor>,
     finished: bool,
 }
 
@@ -993,56 +995,52 @@ impl<'a> Iterator for VoxCPMGenerateStream<'a> {
         while let Some(next_latent) = self.inf_stream.next() {
             match next_latent {
                 Ok(latent) => {
-                    self.all_latents.push(latent);
-                    let pred_seq = match Tensor::cat(&self.all_latents, 1) {
-                        Ok(t) => t,
+                    // latent: [B, 1, P, D]
+                    let (b, _, p, d) = match latent.dims4() {
+                        Ok(dims) => dims,
                         Err(e) => return Some(Err(e.into())),
                     };
-                    let (b, _, _, d) = match pred_seq.dims4() {
-                        Ok(d) => d,
-                        Err(e) => return Some(Err(e.into())),
-                    };
-                    let feat_pred = match pred_seq
+
+                    // Reshape to [B, D, P] for VAE
+                    let latent_vae = match latent
                         .permute((0, 3, 1, 2))
-                        .and_then(|t| t.reshape((b, d, ())))
-                        .and_then(|t| t.contiguous())
+                        .and_then(|t| t.reshape((b, d, p)))
                     {
                         Ok(t) => t,
                         Err(e) => return Some(Err(e.into())),
                     };
 
-                    let audio = match self
-                        .inf_stream
-                        .model
-                        .audio_vae
-                        .decode(&feat_pred.to_dtype(DType::F32).unwrap())
-                    {
-                        Ok(t) => match t.squeeze(1) {
-                            Ok(t) => t,
-                            Err(e) => return Some(Err(e.into())),
-                        },
-                        Err(e) => return Some(Err(e.into())),
-                    };
-
-                    let audio_len = match audio.dim(D::Minus1) {
-                        Ok(l) => l,
-                        Err(e) => return Some(Err(e.into())),
-                    };
-
-                    if audio_len <= 1280 {
-                        continue;
-                    }
-
-                    let total_available = audio_len - 1280;
-                    if total_available > self.yielded_len {
-                        let to_yield = total_available - self.yielded_len;
-                        let chunk = match audio.narrow(D::Minus1, 640 + self.yielded_len, to_yield)
-                        {
-                            Ok(t) => t,
+                    if self.vae_state.is_none() {
+                        let state = match self.inf_stream.model.audio_vae.init_decoder_state(
+                            b,
+                            &latent.device(),
+                            DType::F32,
+                        ) {
+                            Ok(s) => s,
                             Err(e) => return Some(Err(e.into())),
                         };
-                        self.yielded_len += to_yield;
-                        return Some(Ok(chunk));
+                        self.vae_state = Some(state);
+                    }
+
+                    self.all_latents.push(latent);
+
+                    if self.all_latents.len() == 1 {
+                        // Latent 0 skipped
+                    } else {
+                        let audio_chunk = match self.inf_stream.model.audio_vae.decode_stream(
+                            &latent_vae.to_dtype(DType::F32).unwrap(),
+                            self.vae_state.as_mut().unwrap(),
+                        ) {
+                            Ok(t) => match t.squeeze(1) {
+                                Ok(t) => t,
+                                Err(e) => return Some(Err(e.into())),
+                            },
+                            Err(e) => return Some(Err(e.into())),
+                        };
+
+                        if let Some(to_yield) = self.pending_chunk.replace(audio_chunk) {
+                            return Some(Ok(to_yield));
+                        }
                     }
                 }
                 Err(e) => return Some(Err(e)),
