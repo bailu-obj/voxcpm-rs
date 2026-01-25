@@ -1,6 +1,13 @@
 # voxcpm-rs
 
-VoxCPM code from [aha](https://github.com/jhqxxx/aha), 
+VoxCPM code from [aha](https://github.com/jhqxxx/aha)
+
+you can integrate it into your application easily without any modification
+
+optimize including:
+
+1. streaming text to audio
+2. in memory wav buffer
 
 ## Acknowledgments
 
