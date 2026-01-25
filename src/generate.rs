@@ -192,6 +192,48 @@ impl VoxCPMGenerator {
         }
     }
 
+    /// Streaming generation returning WAV bytes (Vec<u8>)
+    pub fn generate_wav_stream_simple(
+        &mut self,
+        target_text: String,
+    ) -> Result<Box<dyn Iterator<Item = Result<Vec<u8>>> + '_>> {
+        let sample_rate = self.sample_rate as u32;
+        let stream = self.generate_stream_simple(target_text)?;
+        let iter = stream.map(move |res| match res {
+            std::result::Result::Ok(tensor) => crate::utils::audio::to_wav(&tensor, sample_rate),
+            Err(e) => Err(e),
+        });
+        Ok(Box::new(iter))
+    }
+
+    /// Streaming generation using prompt cache returning WAV bytes (Vec<u8>)
+    pub fn generate_wav_stream_use_prompt_cache(
+        &mut self,
+        target_text: String,
+        min_len: usize,
+        max_len: usize,
+        inference_timesteps: usize,
+        cfg_value: f64,
+        retry_badcase: bool,
+        retry_badcase_ratio_threshold: f64,
+    ) -> Result<Box<dyn Iterator<Item = Result<Vec<u8>>> + '_>> {
+        let sample_rate = self.sample_rate as u32;
+        let stream = self.generate_stream_use_prompt_cache(
+            target_text,
+            min_len,
+            max_len,
+            inference_timesteps,
+            cfg_value,
+            retry_badcase,
+            retry_badcase_ratio_threshold,
+        )?;
+        let iter = stream.map(move |res| match res {
+            std::result::Result::Ok(tensor) => crate::utils::audio::to_wav(&tensor, sample_rate),
+            Err(e) => Err(e),
+        });
+        Ok(Box::new(iter))
+    }
+
     /// Full inference with all parameters
     ///
     /// # Arguments
