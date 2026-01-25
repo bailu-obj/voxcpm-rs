@@ -26,7 +26,7 @@ impl MiniCPMLongRoPE {
         let head_dim = cfg.hidden_size / cfg.num_attention_heads;
         let rope_theta = cfg.rope_theta;
         let short_factor = cfg.rope_scaling.short_factor.clone();
-        let long_factor = cfg.rope_scaling.short_factor.clone();
+        let long_factor = cfg.rope_scaling.long_factor.clone();
         let original_max_position_embeddings = cfg.rope_scaling.original_max_position_embeddings;
         let max_position_embeddings = cfg.max_position_embeddings;
         let scale = max_position_embeddings as f64 / original_max_position_embeddings as f64;
@@ -103,9 +103,7 @@ pub struct MiniCPMDecoderLayer {
     mlp: GateUpDownMLP,
     input_layernorm: RmsNorm,
     post_attention_layernorm: RmsNorm,
-    scale_depth: f32,
-    num_hidden_layers: usize,
-    use_mup: bool,
+    mup_scale: Option<f64>,
 }
 
 impl MiniCPMDecoderLayer {
@@ -133,14 +131,17 @@ impl MiniCPMDecoderLayer {
             cfg.rms_norm_eps,
             vb.pp("post_attention_layernorm"),
         )?;
+        let mup_scale = if cfg.use_mup {
+            Some(cfg.scale_depth as f64 / (cfg.num_hidden_layers as f64).sqrt())
+        } else {
+            None
+        };
         Ok(Self {
             self_attn,
             mlp,
             input_layernorm,
             post_attention_layernorm,
-            scale_depth: cfg.scale_depth,
-            num_hidden_layers: cfg.num_hidden_layers,
-            use_mup: cfg.use_mup,
+            mup_scale,
         })
     }
 
@@ -151,29 +152,21 @@ impl MiniCPMDecoderLayer {
         sin: &Tensor,
         attention_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
-        let residual = xs.clone();
+        let residual = xs;
         let xs = self.input_layernorm.forward(xs)?;
         let xs = self
             .self_attn
             .forward(&xs, Some(cos), Some(sin), attention_mask, true)?;
-        let xs = if self.use_mup {
-            (residual
-                + xs.affine(
-                    self.scale_depth as f64 / (self.num_hidden_layers as f64).sqrt(),
-                    0.0,
-                ))?
+        let xs = if let Some(scale) = self.mup_scale {
+            (residual + xs.affine(scale, 0.0)?)?
         } else {
             (residual + xs)?
         };
-        let residual = xs.clone();
+        let residual = &xs;
         let xs = xs.apply(&self.post_attention_layernorm)?;
         let xs = xs.apply(&self.mlp)?;
-        let xs = if self.use_mup {
-            (residual
-                + xs.affine(
-                    self.scale_depth as f64 / (self.num_hidden_layers as f64).sqrt(),
-                    0.0,
-                ))?
+        let xs = if let Some(scale) = self.mup_scale {
+            (residual + xs.affine(scale, 0.0)?)?
         } else {
             (residual + xs)?
         };
@@ -187,28 +180,20 @@ impl MiniCPMDecoderLayer {
         sin: &Tensor,
         attention_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
-        let residual = xs.clone();
+        let residual = xs;
         let xs = self.input_layernorm.forward(xs)?;
         let xs = self
             .self_attn
             .forward_with_cache(&xs, cos, sin, attention_mask, true)?;
-        let xs = if self.use_mup {
-            (residual
-                + xs.affine(
-                    self.scale_depth as f64 / (self.num_hidden_layers as f64).sqrt(),
-                    0.0,
-                )?)?
+        let xs = if let Some(scale) = self.mup_scale {
+            (residual + xs.affine(scale, 0.0)?)?
         } else {
             (residual + xs)?
         };
         let residual = &xs;
         let xs = xs.apply(&self.post_attention_layernorm)?.apply(&self.mlp)?;
-        let xs = if self.use_mup {
-            (residual
-                + xs.affine(
-                    self.scale_depth as f64 / (self.num_hidden_layers as f64).sqrt(),
-                    0.0,
-                )?)?
+        let xs = if let Some(scale) = self.mup_scale {
+            (residual + xs.affine(scale, 0.0)?)?
         } else {
             (residual + xs)?
         };
@@ -225,6 +210,7 @@ pub struct MiniCPMModel {
     layers: Vec<MiniCPMDecoderLayer>,
     norm: RmsNorm,
     rope_emb: MiniCPMLongRoPE,
+    mask_cache: Option<(usize, Tensor)>,
 }
 
 impl MiniCPMModel {
@@ -254,6 +240,7 @@ impl MiniCPMModel {
             layers,
             norm,
             rope_emb,
+            mask_cache: None,
         })
     }
 
@@ -268,12 +255,21 @@ impl MiniCPMModel {
             if !is_causal || seq_len <= 1 {
                 None
             } else {
-                Some(prepare_causal_attention_mask(
-                    bs,
-                    seq_len,
-                    0,
-                    input_embeds.device(),
-                )?)
+                if let Some((cached_len, ref mask)) = self.mask_cache {
+                    if cached_len == seq_len {
+                        Some(mask.clone())
+                    } else {
+                        let mask =
+                            prepare_causal_attention_mask(bs, seq_len, 0, input_embeds.device())?;
+                        self.mask_cache = Some((seq_len, mask.clone()));
+                        Some(mask)
+                    }
+                } else {
+                    let mask =
+                        prepare_causal_attention_mask(bs, seq_len, 0, input_embeds.device())?;
+                    self.mask_cache = Some((seq_len, mask.clone()));
+                    Some(mask)
+                }
             }
         };
         let (cos, sin) = self.rope_emb.forward(position_id, seq_len)?;
@@ -297,12 +293,21 @@ impl MiniCPMModel {
             if seq_len <= 1 {
                 None
             } else {
-                Some(prepare_causal_attention_mask(
-                    bs,
-                    seq_len,
-                    0,
-                    input_embeds.device(),
-                )?)
+                if let Some((cached_len, ref mask)) = self.mask_cache {
+                    if cached_len == seq_len {
+                        Some(mask.clone())
+                    } else {
+                        let mask =
+                            prepare_causal_attention_mask(bs, seq_len, 0, input_embeds.device())?;
+                        self.mask_cache = Some((seq_len, mask.clone()));
+                        Some(mask)
+                    }
+                } else {
+                    let mask =
+                        prepare_causal_attention_mask(bs, seq_len, 0, input_embeds.device())?;
+                    self.mask_cache = Some((seq_len, mask.clone()));
+                    Some(mask)
+                }
             }
         };
         let (cos, sin) = self.rope_emb.forward(position_id, seq_len)?;

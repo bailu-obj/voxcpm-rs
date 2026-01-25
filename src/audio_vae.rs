@@ -94,7 +94,7 @@ impl CausalConvTranspose1d {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let x = self.conv_transpose1d.forward(x)?;
         let last_dim = x.dim(D::Minus1)?;
-        let select_num = last_dim - (self.padding * 2 - self.output_padding);
+        let select_num = last_dim.saturating_sub(self.padding * 2 - self.output_padding);
         let x = x.narrow(D::Minus1, 0, select_num)?;
         Ok(x)
     }
@@ -225,26 +225,23 @@ impl WNCausalConvTranspose1d {
 
 pub struct Snake1d {
     alpha: Tensor,
+    alpha_recip: Tensor,
 }
 impl Snake1d {
     pub fn new(vb: VarBuilder, channels: usize) -> Result<Self> {
         let alpha = vb.get((1, channels, 1), "alpha")?;
-        Ok(Self { alpha })
+        let alpha_recip = alpha.affine(1.0, 1e-9)?.recip()?;
+        Ok(Self { alpha, alpha_recip })
     }
 
     // x + sin(alpha*x)^2 / alpha
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let dims = x.dims();
-        let x = x.reshape((dims[0], dims[1], ()))?;
-        let alpha_ = self.alpha.affine(1.0, 1e-9)?.recip()?;
-        let alpha_ = x
+        let x_out = x
             .broadcast_mul(&self.alpha)?
             .sin()?
-            .powf(2.0)?
-            .broadcast_mul(&alpha_)?;
-        let x = x.add(&alpha_)?;
-        let x = x.reshape(dims)?;
-        Ok(x)
+            .sqr()?
+            .broadcast_mul(&self.alpha_recip)?;
+        Ok(x.add(&x_out)?)
     }
 }
 
@@ -282,7 +279,6 @@ impl CausalResidualUnit {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         // let orig_dim = x.dims();
         let last_dim_x = x.dim(D::Minus1)?;
-        let mut res_x = x.clone();
         let y = self.block0.forward(x)?;
         let y = self.block1.forward(&y)?;
         let y = self.block2.forward(&y)?;
@@ -291,19 +287,19 @@ impl CausalResidualUnit {
         let last_dim_y = y.dim(D::Minus1)?;
         let pad = (last_dim_x - last_dim_y) / 2;
         if pad > 0 {
-            res_x = res_x.narrow(D::Minus1, pad, last_dim_y)?;
+            let res_x = x.narrow(D::Minus1, pad, last_dim_y)?;
+            Ok(y.add(&res_x)?)
+        } else {
+            Ok(y.add(x)?)
         }
-        let x = y.add(&res_x)?;
-        Ok(x)
     }
 
     pub fn forward_stream(&self, x: &Tensor, states: &mut Vec<Tensor>) -> Result<Tensor> {
-        let res_x = x.clone();
         let y = self.block0.forward(x)?;
         let y = self.block1.forward_stream(&y, &mut states[0])?;
         let y = self.block2.forward(&y)?;
         let y = self.block3.forward_stream(&y, &mut states[1])?;
-        let x = y.add(&res_x)?;
+        let x = y.add(x)?;
         Ok(x)
     }
 

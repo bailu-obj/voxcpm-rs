@@ -48,13 +48,20 @@ impl ScalarQuantizationLayer {
 }
 
 pub struct SinusoidalPosEmb {
-    dim: usize,
+    inv_freq: Tensor,
 }
 
 impl SinusoidalPosEmb {
     pub fn new(dim: usize) -> Result<Self> {
         assert_eq!(dim % 2, 0, "SinusoidalPosEmb requires dim to be even");
-        Ok(Self { dim })
+        let half_dim = dim / 2;
+        let dif = 10000.0_f64.ln() / (half_dim - 1) as f64;
+        // We will compute frequencies on the fly if device differs, but usually it's the same.
+        // For now, let's keep it simple and just store the base.
+        let inv_freq = Tensor::arange(0.0, half_dim as f32, &Device::Cpu)?
+            .affine(-dif, 0.0)?
+            .exp()?;
+        Ok(Self { inv_freq })
     }
     pub fn forward(&self, x: &Tensor, scale: usize) -> Result<Tensor> {
         let x = if x.rank() < 1 {
@@ -62,18 +69,13 @@ impl SinusoidalPosEmb {
         } else {
             x.clone()
         };
-        let half_dim = self.dim / 2;
-        let dif = 10000.0_f64.ln() / (half_dim - 1) as f64;
-        let emb = Tensor::arange(0.0, half_dim as f32, x.device())?
-            .affine(-dif, 0.0)?
-            .exp()?
-            .to_dtype(x.dtype())?;
+        let inv_freq = self.inv_freq.to_device(x.device())?.to_dtype(x.dtype())?;
 
         let emb = x
             .unsqueeze(1)?
             .contiguous()?
             .affine(scale as f64, 0.0)?
-            .matmul(&emb.unsqueeze(0)?.contiguous()?)?;
+            .matmul(&inv_freq.unsqueeze(0)?.contiguous()?)?;
         let emb = Tensor::cat(&[emb.sin()?, emb.cos()?], D::Minus1)?;
         Ok(emb)
     }
@@ -156,11 +158,15 @@ impl VoxCPMLocDiT {
         t: &Tensor,
         cond: &Tensor,
         dt: &Tensor,
+        cond_is_projected: bool,
     ) -> Result<Tensor> {
         let x = self.in_proj.forward(&x.transpose(1, 2)?.contiguous()?)?;
-        let cond = self
-            .cond_proj
-            .forward(&cond.transpose(1, 2)?.contiguous()?)?;
+        let cond = if cond_is_projected {
+            cond.to_owned()
+        } else {
+            self.cond_proj
+                .forward(&cond.transpose(1, 2)?.contiguous()?)?
+        };
         let prefix = cond.dim(1)?;
         let t = self.time_embeddings.forward(t, 1000)?.to_dtype(x.dtype())?;
         let t = self.time_mlp.forward(&t)?;
@@ -257,26 +263,34 @@ impl UnifiedCFM {
         let zero_init_steps = max(1, (t_span_len as f32 * 0.04) as usize);
         let mut dphi_dt;
         let mut x = x.to_owned();
+
+        let b = x.dim(0)?;
+        let mu_in = if self.mean_mode {
+            Tensor::cat(&[mu, mu], 0)?
+        } else {
+            let mu_zeros = Tensor::zeros((b, mu.dim(1)?), x.dtype(), x.device())?;
+            Tensor::cat(&[mu, &mu_zeros], 0)?
+        };
+        let cond_proj = self
+            .estimator
+            .cond_proj
+            .forward(&cond.transpose(1, 2)?.contiguous()?)?;
+        let cond_in = Tensor::cat(&[&cond_proj, &cond_proj], 0)?;
+
         for step in 1..t_span_len {
             if use_cfg_zero_star && step <= zero_init_steps {
-                // dphi_dt = Tensor::zeros(1, t_span.dtype(), t_span.device())?;
                 dphi_dt = x.zeros_like()?;
             } else {
-                let b = x.dim(0)?;
-                // let x_in = Tensor::zeros((2*b, self.in_channels, x.dim(2)?), x.dtype(), x.device())?;
-                let x_in = Tensor::cat(&[x.clone(), x.clone()], 0)?;
-                let mu_in = Tensor::zeros((b, mu.dim(1)?), x.dtype(), x.device())?;
-                let mu_in = Tensor::cat(&[mu.clone(), mu_in], 0)?;
+                let x_in = Tensor::cat(&[&x, &x], 0)?;
                 let t_in = t.broadcast_as(2 * b)?;
                 let dt_in = if self.mean_mode {
                     dt.broadcast_as(2 * b)?
                 } else {
                     Tensor::zeros(2 * b, x.dtype(), x.device())?
                 };
-                let cond_in = Tensor::cat(&[cond, cond], 0)?;
                 dphi_dt = self
                     .estimator
-                    .forward(&x_in, &mu_in, &t_in, &cond_in, &dt_in)?;
+                    .forward(&x_in, &mu_in, &t_in, &cond_in, &dt_in, true)?;
                 let split = dphi_dt.split(&[b, b], 0)?;
                 dphi_dt = split[0].to_owned();
                 let cfg_dphi_dt = split[1].to_owned();
@@ -292,9 +306,8 @@ impl UnifiedCFM {
                 }
                 let cfg = cfg_dphi_dt.broadcast_mul(&st_star)?;
                 dphi_dt = cfg.add(&dphi_dt.sub(&cfg)?.affine(cfg_value, 0.0)?)?;
-                // step步的预测噪声
             }
-            x = x.broadcast_sub(&dphi_dt.broadcast_mul(&dt)?)?; // 逐步去噪
+            x = x.broadcast_sub(&dphi_dt.broadcast_mul(&dt)?)?;
             t = t.sub(&dt)?;
             sol.push(x.to_owned());
             if step < t_span_len - 1 {
@@ -1011,6 +1024,9 @@ impl<'a> Iterator for VoxCPMGenerateStream<'a> {
                 }
                 Err(e) => return Some(Err(e)),
             }
+        }
+        if let Some(to_yield) = self.pending_chunk.take() {
+            return Some(Ok(to_yield));
         }
 
         self.finished = true;

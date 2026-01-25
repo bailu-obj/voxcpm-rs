@@ -80,10 +80,10 @@ fn main() -> Result<()> {
                     text.clone(),
                     5,    // min_len
                     500,  // max_len
-                    15,   // timesteps
-                    2.5,  // cfg
+                    10,   // timesteps
+                    2.0,  // cfg
                     true, // use cache
-                    6.0,  // retry threshold
+                    3.0,  // retry threshold
                 )?)
             } else {
                 Box::new(generator.generate_stream_simple(text.clone())?)
@@ -153,10 +153,10 @@ fn main() -> Result<()> {
                     text.clone(),
                     5,    // min_len
                     500,  // max_len
-                    15,   // timesteps
-                    2.5,  // cfg
+                    10,   // timesteps
+                    2.0,  // cfg
                     true, // use cache
-                    6.0,  // retry threshold
+                    3.0,  // retry threshold
                 )?
             } else {
                 generator.generate_simple(text.clone())?

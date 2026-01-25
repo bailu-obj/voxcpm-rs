@@ -1,15 +1,13 @@
 use anyhow::Result;
-use candle_core::{DType, Device, IndexOp, Tensor, D};
-use candle_transformers::models::deepseek2::SplitOp;
+use candle_core::{DType, Tensor, D};
 
-use crate::utils::tensor::{index_select_2d, split_tensor};
-
+#[inline]
 pub fn compute_default_rope_parameters(dim: usize, base: f32) -> Vec<f32> {
-    let inv_freq: Vec<f32> = (0..dim)
+    let inv_dim = 1.0f32 / dim as f32;
+    (0..dim)
         .step_by(2)
-        .map(|i| 1.0_f32 / base.powf(i as f32 / dim as f32))
-        .collect();
-    inv_freq
+        .map(|i| base.powf(-(i as f32) * inv_dim))
+        .collect()
 }
 
 pub fn rotate_half(x: &Tensor) -> Result<Tensor> {

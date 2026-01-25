@@ -1,17 +1,12 @@
 use anyhow::Result;
 use candle_core::{Tensor, D};
-use candle_nn::{
-    linear, linear_no_bias, rms_norm, Activation, Linear, Module, RmsNorm, VarBuilder,
-};
+use candle_nn::{linear, linear_no_bias, Activation, Linear, Module, RmsNorm, VarBuilder};
 
 use crate::position_embed::rope::apply_rotary_pos_emb;
-use crate::utils::tensor::{prepare_causal_attention_mask, repeat_kv};
+use crate::utils::tensor::repeat_kv;
 
-/// Gate-Up-Down MLP (SwiGLU style)
-#[derive(Debug, Clone)]
 pub struct GateUpDownMLP {
-    gate_proj: Linear,
-    up_proj: Linear,
+    gate_up_proj: Linear, // hidden → 2 * intermediate
     down_proj: Linear,
     act_fn: Activation,
 }
@@ -24,22 +19,42 @@ impl GateUpDownMLP {
         act_fn: Activation,
         bias: bool,
     ) -> Result<Self> {
-        let (gate_proj, up_proj, down_proj) = if bias {
-            (
-                linear(hidden_size, intermediate_size, vb.pp("gate_proj"))?,
-                linear(hidden_size, intermediate_size, vb.pp("up_proj"))?,
-                linear(intermediate_size, hidden_size, vb.pp("down_proj"))?,
-            )
+        let gate_proj = if bias {
+            linear(hidden_size, intermediate_size, vb.pp("gate_proj"))?
         } else {
-            (
-                linear_no_bias(hidden_size, intermediate_size, vb.pp("gate_proj"))?,
-                linear_no_bias(hidden_size, intermediate_size, vb.pp("up_proj"))?,
-                linear_no_bias(intermediate_size, hidden_size, vb.pp("down_proj"))?,
-            )
+            linear_no_bias(hidden_size, intermediate_size, vb.pp("gate_proj"))?
         };
+
+        let up_proj = if bias {
+            linear(hidden_size, intermediate_size, vb.pp("up_proj"))?
+        } else {
+            linear_no_bias(hidden_size, intermediate_size, vb.pp("up_proj"))?
+        };
+
+        // 2️⃣ Fuse weights
+        let gate_w = gate_proj.weight();
+        let up_w = up_proj.weight();
+        let fused_w = Tensor::cat(&[gate_w, up_w], 0)?; // [2I, H]
+
+        let fused_b = if bias {
+            Some(Tensor::cat(
+                &[gate_proj.bias().unwrap(), up_proj.bias().unwrap()],
+                0,
+            )?)
+        } else {
+            None
+        };
+
+        let gate_up_proj = Linear::new(fused_w, fused_b);
+
+        let down_proj = if bias {
+            linear(intermediate_size, hidden_size, vb.pp("down_proj"))?
+        } else {
+            linear_no_bias(intermediate_size, hidden_size, vb.pp("down_proj"))?
+        };
+
         Ok(Self {
-            gate_proj,
-            up_proj,
+            gate_up_proj,
             down_proj,
             act_fn,
         })
@@ -48,9 +63,11 @@ impl GateUpDownMLP {
 
 impl Module for GateUpDownMLP {
     fn forward(&self, xs: &Tensor) -> candle_core::Result<Tensor> {
-        let lhs = xs.apply(&self.gate_proj)?.apply(&self.act_fn)?;
-        let rhs = xs.apply(&self.up_proj)?;
-        (lhs * rhs)?.apply(&self.down_proj)
+        let gate_up = xs.apply(&self.gate_up_proj)?;
+        let chunks = gate_up.chunk(2, D::Minus1)?;
+        let (gate, up) = (&chunks[0], &chunks[1]);
+        let res = (gate.apply(&self.act_fn)? * up)?;
+        res.apply(&self.down_proj)
     }
 }
 
@@ -192,20 +209,18 @@ impl NaiveAttention {
         let (query_states, key_states) =
             apply_rotary_pos_emb(&query_states, &key_states, cos, sin, tof32)?;
 
-        let (key_states, value_states) = match self.kv_cache.take() {
-            None => (key_states, value_states),
-            Some((prev_k, prev_v)) => {
-                let key_states = Tensor::cat(&[&prev_k, &key_states], 2)?;
-                let value_states = Tensor::cat(&[&prev_v, &value_states], 2)?;
-                (key_states, value_states)
-            }
-        };
+        if self.kv_cache.is_none() {
+            self.kv_cache = Some((key_states, value_states));
+        } else if let Some((k, v)) = &mut self.kv_cache {
+            *k = Tensor::cat(&[&*k, &key_states], 2)?;
+            *v = Tensor::cat(&[&*v, &value_states], 2)?;
+        }
+        let (key_states, value_states) = self.kv_cache.as_ref().unwrap();
 
-        self.kv_cache = Some((key_states.clone(), value_states.clone()));
         let attn_output = eager_attention_forward(
             &query_states,
-            &key_states,
-            &value_states,
+            key_states,
+            value_states,
             Some(self.num_kv_groups),
             attention_mask,
             self.scale,
@@ -229,21 +244,24 @@ pub fn eager_attention_forward(
     attention_mask: Option<&Tensor>,
     scaling: f64,
 ) -> Result<Tensor> {
-    // Apply KV grouping if needed and ensure contiguous layout
+    // Apply KV grouping if needed
     let (key_states, value_states) = match num_key_value_groups {
         Some(g) => {
-            let k = repeat_kv(key_states.clone(), g)?.contiguous()?;
-            let v = repeat_kv(value_states.clone(), g)?.contiguous()?;
+            let k = repeat_kv(key_states, g)?;
+            let v = repeat_kv(value_states, g)?;
             (k, v)
         }
-        None => (key_states.contiguous()?, value_states.contiguous()?),
+        None => (key_states.clone(), value_states.clone()),
     };
-
-    let query_states = query_states.contiguous()?;
 
     let attn_output = {
         #[cfg(not(feature = "flash-attn"))]
         {
+            // Ensure contiguous layout for matmul operations
+            let query_states = query_states.contiguous()?;
+            let key_states = key_states.contiguous()?;
+            let value_states = value_states.contiguous()?;
+
             let mut attn_weights = query_states
                 .matmul(&key_states.transpose(D::Minus2, D::Minus1)?)?
                 .affine(scaling, 0.0)?;
@@ -256,9 +274,9 @@ pub fn eager_attention_forward(
         }
         #[cfg(feature = "flash-attn")]
         {
-            let query_states = query_states.transpose(1, 2)?;
-            let key_states = key_states.transpose(1, 2)?;
-            let value_states = value_states.transpose(1, 2)?;
+            let query_states = query_states.contiguous()?.transpose(1, 2)?;
+            let key_states = key_states.contiguous()?.transpose(1, 2)?;
+            let value_states = value_states.contiguous()?.transpose(1, 2)?;
             let attn_output = candle_flash_attn::flash_attn(
                 &query_states,
                 &key_states,

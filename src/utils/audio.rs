@@ -1,7 +1,6 @@
 use anyhow::{anyhow, Result};
-use candle_core::{DType, Device, Tensor, D};
+use candle_core::{Device, Tensor, D};
 use candle_nn::{Conv1d, Conv1dConfig, Module};
-use hound::{SampleFormat, WavReader};
 use num::integer::gcd;
 use std::io::Cursor;
 use symphonia::core::audio::{AudioBufferRef, Signal};
@@ -11,28 +10,10 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
-use super::tensor::linspace;
-
 /// Resampling method
 #[derive(Debug, Clone, Copy)]
 pub enum ResamplingMethod {
     SincInterpHann,
-}
-
-/// Zero-order modified Bessel function I0
-fn i0(x: f32) -> f32 {
-    let mut result = 1.0;
-    let mut term = 1.0;
-    let half_x_sq = x * x / 4.0;
-
-    for k in 1..50 {
-        term = term * half_x_sq / (k * k) as f32;
-        result += term;
-        if term < 1e-12 {
-            break;
-        }
-    }
-    result
 }
 
 /// Get sinc resample kernel

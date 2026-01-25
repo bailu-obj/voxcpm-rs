@@ -32,15 +32,15 @@ pub fn prepare_causal_attention_mask(
     Ok(mask)
 }
 
-pub fn repeat_kv(xs: Tensor, n_rep: usize) -> Result<Tensor> {
+pub fn repeat_kv(xs: &Tensor, n_rep: usize) -> Result<Tensor> {
     if n_rep == 1 {
-        Ok(xs)
+        Ok(xs.clone())
     } else {
         let (b_sz, n_kv_head, seq_len, head_dim) = xs.dims4()?;
         // Using cat is faster than a broadcast as it avoids going through a potentially
         // strided copy.
         // https://github.com/huggingface/candle/pull/2043
-        let kv = Tensor::cat(&vec![&xs; n_rep], 2)?.reshape((
+        let kv = Tensor::cat(&vec![xs; n_rep], 2)?.reshape((
             b_sz,
             n_kv_head * n_rep,
             seq_len,
