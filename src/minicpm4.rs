@@ -61,30 +61,32 @@ impl MiniCPMLongRoPE {
         })
     }
     pub fn update_cos_sin_cache(&mut self, seqlen: usize) -> Result<()> {
-        self.max_seq_len_cached = seqlen;
-        let t = Tensor::arange(0.0_f32, seqlen as f32, &self.device)?.reshape((seqlen, 1))?;
+        let actual_len = seqlen.max(self.max_seq_len_cached * 2);
+        self.max_seq_len_cached = actual_len;
+        let t =
+            Tensor::arange(0.0_f32, actual_len as f32, &self.device)?.reshape((actual_len, 1))?;
         let mut ext_factors = Tensor::from_slice(
             &self.short_factor,
             (1, self.short_factor.len()),
             &self.device,
         )?;
-        if seqlen > self.original_max_position_embeddings {
+        if actual_len > self.original_max_position_embeddings {
             ext_factors =
                 Tensor::from_slice(&self.long_factor, (1, self.long_factor.len()), &self.device)?;
         }
-        let ext_factors = Tensor::ones_like(&ext_factors)?.div(&ext_factors)?;
-        let freqs = t.matmul(&ext_factors)?.broadcast_mul(&self.inv_freq)?;
+        let inv_freq = self
+            .inv_freq
+            .broadcast_mul(&Tensor::ones_like(&ext_factors)?.div(&ext_factors)?)?;
+        let freqs = t.matmul(&inv_freq)?;
         let emb = Tensor::cat(&[&freqs, &freqs], D::Minus1)?;
-        let cos_cached = emb
+        self.cos_cached = emb
             .cos()?
             .affine(self.scaling_factor, 0.0)?
             .to_dtype(self.dtype)?;
-        let sin_cached = emb
+        self.sin_cached = emb
             .sin()?
             .affine(self.scaling_factor, 0.0)?
             .to_dtype(self.dtype)?;
-        self.cos_cached = cos_cached;
-        self.sin_cached = sin_cached;
         Ok(())
     }
     pub fn forward(&mut self, pos_offset: usize, seqlen: usize) -> Result<(Tensor, Tensor)> {
@@ -283,35 +285,38 @@ impl MiniCPMModel {
     }
 
     pub fn forward_with_cache(&mut self, xs: &Tensor, position_id: usize) -> Result<Tensor> {
-        let input_embeds = match xs.rank() {
-            2 => xs.unsqueeze(1)?,
-            3 => xs.to_owned(),
-            _ => return Err(anyhow!("MiniCPMModelinput_embeds illigal")),
+        let (bs, seq_len, _) = match xs.rank() {
+            2 => (xs.dim(0)?, 1, xs.dim(1)?),
+            3 => (xs.dim(0)?, xs.dim(1)?, xs.dim(2)?),
+            _ => return Err(anyhow!("MiniCPMModel input_embeds rank must be 2 or 3")),
         };
-        let (bs, seq_len, _) = input_embeds.dims3()?;
-        let attention_mask: Option<Tensor> = {
-            if seq_len <= 1 {
-                None
-            } else {
-                if let Some((cached_len, ref mask)) = self.mask_cache {
-                    if cached_len == seq_len {
-                        Some(mask.clone())
-                    } else {
-                        let mask =
-                            prepare_causal_attention_mask(bs, seq_len, 0, input_embeds.device())?;
-                        self.mask_cache = Some((seq_len, mask.clone()));
-                        Some(mask)
-                    }
+
+        let mut hidden_states = if xs.rank() == 2 {
+            xs.unsqueeze(1)?
+        } else {
+            xs.clone()
+        };
+
+        let attention_mask: Option<Tensor> = if seq_len <= 1 {
+            None
+        } else {
+            if let Some((cached_len, ref mask)) = self.mask_cache {
+                if cached_len == seq_len {
+                    Some(mask.clone())
                 } else {
                     let mask =
-                        prepare_causal_attention_mask(bs, seq_len, 0, input_embeds.device())?;
+                        prepare_causal_attention_mask(bs, seq_len, 0, hidden_states.device())?;
                     self.mask_cache = Some((seq_len, mask.clone()));
                     Some(mask)
                 }
+            } else {
+                let mask = prepare_causal_attention_mask(bs, seq_len, 0, hidden_states.device())?;
+                self.mask_cache = Some((seq_len, mask.clone()));
+                Some(mask)
             }
         };
+
         let (cos, sin) = self.rope_emb.forward(position_id, seq_len)?;
-        let mut hidden_states = input_embeds.clone();
         for decode_layer in &mut self.layers {
             hidden_states = decode_layer.forward_with_cache(
                 &hidden_states,

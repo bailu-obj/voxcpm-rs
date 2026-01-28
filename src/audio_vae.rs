@@ -299,8 +299,7 @@ impl CausalResidualUnit {
         let y = self.block1.forward_stream(&y, &mut states[0])?;
         let y = self.block2.forward(&y)?;
         let y = self.block3.forward_stream(&y, &mut states[1])?;
-        let x = y.add(x)?;
-        Ok(x)
+        Ok(y.add(x)?)
     }
 
     pub fn init_states(

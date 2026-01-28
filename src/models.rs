@@ -49,6 +49,7 @@ impl ScalarQuantizationLayer {
 
 pub struct SinusoidalPosEmb {
     inv_freq: Tensor,
+    cached_inv_freq: Option<Tensor>,
 }
 
 impl SinusoidalPosEmb {
@@ -56,20 +57,28 @@ impl SinusoidalPosEmb {
         assert_eq!(dim % 2, 0, "SinusoidalPosEmb requires dim to be even");
         let half_dim = dim / 2;
         let dif = 10000.0_f64.ln() / (half_dim - 1) as f64;
-        // We will compute frequencies on the fly if device differs, but usually it's the same.
-        // For now, let's keep it simple and just store the base.
         let inv_freq = Tensor::arange(0.0, half_dim as f32, &Device::Cpu)?
             .affine(-dif, 0.0)?
             .exp()?;
-        Ok(Self { inv_freq })
+        Ok(Self {
+            inv_freq,
+            cached_inv_freq: None,
+        })
     }
-    pub fn forward(&self, x: &Tensor, scale: usize) -> Result<Tensor> {
+    pub fn forward(&mut self, x: &Tensor, scale: usize) -> Result<Tensor> {
         let x = if x.rank() < 1 {
             x.unsqueeze(0)?
         } else {
             x.clone()
         };
-        let inv_freq = self.inv_freq.to_device(x.device())?.to_dtype(x.dtype())?;
+
+        if self.cached_inv_freq.is_none()
+            || self.cached_inv_freq.as_ref().unwrap().device().location() != x.device().location()
+            || self.cached_inv_freq.as_ref().unwrap().dtype() != x.dtype()
+        {
+            self.cached_inv_freq = Some(self.inv_freq.to_device(x.device())?.to_dtype(x.dtype())?);
+        }
+        let inv_freq = self.cached_inv_freq.as_ref().unwrap();
 
         let emb = x
             .unsqueeze(1)?
@@ -160,29 +169,25 @@ impl VoxCPMLocDiT {
         dt: &Tensor,
         cond_is_projected: bool,
     ) -> Result<Tensor> {
-        let x = self.in_proj.forward(&x.transpose(1, 2)?.contiguous()?)?;
+        let x = self.in_proj.forward(x)?;
         let cond = if cond_is_projected {
             cond.to_owned()
         } else {
-            self.cond_proj
-                .forward(&cond.transpose(1, 2)?.contiguous()?)?
+            self.cond_proj.forward(cond)?
         };
         let prefix = cond.dim(1)?;
-        let t = self.time_embeddings.forward(t, 1000)?.to_dtype(x.dtype())?;
+        let dtype = x.dtype();
+        let t = self.time_embeddings.forward(t, 1000)?.to_dtype(dtype)?;
         let t = self.time_mlp.forward(&t)?;
-        let dt = self
-            .time_embeddings
-            .forward(dt, 1000)?
-            .to_dtype(x.dtype())?;
+        let dt = self.time_embeddings.forward(dt, 1000)?.to_dtype(dtype)?;
         let dt = self.delta_time_mlp.forward(&dt)?;
-        let t = t.add(&dt)?;
+        let t_total = t.add(&dt)?;
 
-        let x = Tensor::cat(&[mu.add(&t)?.unsqueeze(1)?, cond, x], 1)?;
+        let x = Tensor::cat(&[mu.add(&t_total)?.unsqueeze(1)?, cond, x], 1)?;
         let hidden = self.decoder.forward(&x, 0, false)?;
-        let select_len = hidden.dims()[1] - (prefix + 1);
-        let hidden = hidden.narrow(1, prefix + 1, select_len)?;
+        let select_len = hidden.dim(1)? - (prefix + 1);
+        let hidden = hidden.narrow(1, prefix + 1, select_len)?.contiguous()?;
         let hidden = self.out_proj.forward(&hidden)?;
-        let hidden = hidden.transpose(1, 2)?.contiguous()?;
         Ok(hidden)
     }
 }
@@ -191,6 +196,7 @@ pub struct UnifiedCFM {
     in_channels: usize,
     mean_mode: bool,
     estimator: VoxCPMLocDiT,
+    t_span_cache: Option<(usize, f64, Tensor)>,
 }
 
 impl UnifiedCFM {
@@ -204,6 +210,7 @@ impl UnifiedCFM {
             in_channels,
             mean_mode,
             estimator,
+            t_span_cache: None,
         })
     }
 
@@ -221,10 +228,40 @@ impl UnifiedCFM {
         let (b, _) = mu.dims2()?;
         let t = patch_size;
         let dtype = mu.dtype();
-        let z = Tensor::randn(0.0f32, 1.0, (b, self.in_channels, t), mu.device())?
+        let device = mu.device();
+        let z = Tensor::randn(0.0f32, 1.0, (b, t, self.in_channels), device)?
             .to_dtype(dtype)?
             .affine(temperature, 0.0)?;
-        let t_span = linspace(1.0, 0.0, n_timesteps + 1, mu.device())?.to_dtype(dtype)?;
+
+        let t_span = if let Some((cached_n, cached_sway, cached_t_span)) = &self.t_span_cache {
+            if *cached_n == n_timesteps
+                && *cached_sway == sway_sampling_coef
+                && cached_t_span.device().location() == device.location()
+            {
+                cached_t_span.clone()
+            } else {
+                let ts = self.compute_t_span(n_timesteps, sway_sampling_coef, device, dtype)?;
+                self.t_span_cache = Some((n_timesteps, sway_sampling_coef, ts.clone()));
+                ts
+            }
+        } else {
+            let ts = self.compute_t_span(n_timesteps, sway_sampling_coef, device, dtype)?;
+            self.t_span_cache = Some((n_timesteps, sway_sampling_coef, ts.clone()));
+            ts
+        };
+
+        let x = self.solve_euler(&z, &t_span, mu, cond, cfg_value, use_cfg_zero_star)?;
+        Ok(x)
+    }
+
+    fn compute_t_span(
+        &self,
+        n_timesteps: usize,
+        sway_sampling_coef: f64,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Tensor> {
+        let t_span = linspace(1.0, 0.0, n_timesteps + 1, device)?.to_dtype(dtype)?;
         let t_span = t_span
             .affine(std::f64::consts::PI / 2.0, 0.0)?
             .cos()?
@@ -232,8 +269,7 @@ impl UnifiedCFM {
             .add(&t_span)?
             .affine(sway_sampling_coef, 0.0)?
             .add(&t_span)?;
-        let x = self.solve_euler(&z, &t_span, mu, cond, cfg_value, use_cfg_zero_star)?;
-        Ok(x)
+        Ok(t_span)
     }
 
     pub fn optimized_scale(
@@ -261,55 +297,62 @@ impl UnifiedCFM {
         let mut sol = Vec::new();
         let t_span_len = t_span.dim(0)?;
         let zero_init_steps = max(1, (t_span_len as f32 * 0.04) as usize);
-        let mut dphi_dt;
         let mut x = x.to_owned();
 
         let b = x.dim(0)?;
+        let dtype = x.dtype();
+        let device = x.device().clone();
         let mu_in = if self.mean_mode {
             Tensor::cat(&[mu, mu], 0)?
         } else {
-            let mu_zeros = Tensor::zeros((b, mu.dim(1)?), x.dtype(), x.device())?;
+            let mu_zeros = Tensor::zeros(mu.dims(), dtype, &device)?;
             Tensor::cat(&[mu, &mu_zeros], 0)?
         };
-        let cond_proj = self
-            .estimator
-            .cond_proj
-            .forward(&cond.transpose(1, 2)?.contiguous()?)?;
+        let cond_proj = self.estimator.cond_proj.forward(cond)?;
         let cond_in = Tensor::cat(&[&cond_proj, &cond_proj], 0)?;
 
+        let b2 = 2 * b;
+
         for step in 1..t_span_len {
-            if use_cfg_zero_star && step <= zero_init_steps {
-                dphi_dt = x.zeros_like()?;
-            } else {
-                let x_in = Tensor::cat(&[&x, &x], 0)?;
-                let t_in = t.broadcast_as(2 * b)?;
-                let dt_in = if self.mean_mode {
-                    dt.broadcast_as(2 * b)?
+            let next_dphi_dt = {
+                if use_cfg_zero_star && step <= zero_init_steps {
+                    Tensor::zeros(x.dims(), x.dtype(), x.device())?
                 } else {
-                    Tensor::zeros(2 * b, x.dtype(), x.device())?
-                };
-                dphi_dt = self
-                    .estimator
-                    .forward(&x_in, &mu_in, &t_in, &cond_in, &dt_in, true)?;
-                let split = dphi_dt.split(&[b, b], 0)?;
-                dphi_dt = split[0].to_owned();
-                let cfg_dphi_dt = split[1].to_owned();
-                let mut st_star = Tensor::ones(1, x.dtype(), x.device())?;
-                if use_cfg_zero_star {
-                    let positive_flat = dphi_dt.reshape((b, ()))?;
-                    let negative_flat = cfg_dphi_dt.reshape((b, ()))?;
-                    st_star = self.optimized_scale(&positive_flat, &negative_flat)?;
-                    let mut vec_shape = vec![b];
-                    let vec_shape1 = vec![1; dphi_dt.rank() - 1];
-                    vec_shape.extend_from_slice(&vec_shape1);
-                    st_star = st_star.reshape(vec_shape)?;
+                    let x_in = Tensor::cat(&[&x, &x], 0)?;
+                    let t_in = t.broadcast_as(b2)?;
+                    let dt_in = if self.mean_mode {
+                        dt.broadcast_as(b2)?
+                    } else {
+                        Tensor::zeros(b2, dtype, &device)?
+                    };
+                    let dphi_dt_combined = self
+                        .estimator
+                        .forward(&x_in, &mu_in, &t_in, &cond_in, &dt_in, true)?;
+                    let split = dphi_dt_combined.split(&[b, b], 0)?;
+                    let dphi_dt_pos = split[0].contiguous()?;
+                    let cfg_dphi_dt = split[1].contiguous()?;
+
+                    if cfg_value != 1.0 || use_cfg_zero_star {
+                        let mut st_star = Tensor::ones(1, dtype, &device)?;
+                        if use_cfg_zero_star {
+                            let positive_flat = dphi_dt_pos.reshape((b, ()))?;
+                            let negative_flat = cfg_dphi_dt.reshape((b, ()))?;
+                            st_star = self.optimized_scale(&positive_flat, &negative_flat)?;
+                            let mut vec_shape = vec![b];
+                            vec_shape.extend(vec![1; dphi_dt_pos.rank() - 1]);
+                            st_star = st_star.reshape(vec_shape)?;
+                        }
+                        let cfg = cfg_dphi_dt.broadcast_mul(&st_star)?;
+                        cfg.add(&dphi_dt_pos.sub(&cfg)?.affine(cfg_value, 0.0)?)?
+                            .contiguous()?
+                    } else {
+                        dphi_dt_pos.contiguous()?
+                    }
                 }
-                let cfg = cfg_dphi_dt.broadcast_mul(&st_star)?;
-                dphi_dt = cfg.add(&dphi_dt.sub(&cfg)?.affine(cfg_value, 0.0)?)?;
-            }
-            x = x.broadcast_sub(&dphi_dt.broadcast_mul(&dt)?)?;
+            };
+            x = x.broadcast_sub(&next_dphi_dt.broadcast_mul(&dt)?)?;
             t = t.sub(&dt)?;
-            sol.push(x.to_owned());
+            sol.push(x.clone());
             if step < t_span_len - 1 {
                 dt = t.sub(&t_span.i(step + 1)?)?;
             }
@@ -831,23 +874,17 @@ impl<'a> Iterator for VoxCPMInferenceStream<'a> {
             return None;
         }
 
-        let dit_hidden_1 = match self.model.lm_to_dit_proj.forward(&self.lm_hidden) {
+        let dit_hidden = match self
+            .model
+            .lm_to_dit_proj
+            .forward(&self.lm_hidden)
+            .and_then(|t1| {
+                self.model
+                    .res_to_dit_proj
+                    .forward(&self.residual_hidden)
+                    .and_then(|t2| t1.add(&t2))
+            }) {
             Ok(t) => t,
-            Err(e) => return Some(Err(e.into())),
-        };
-        let dit_hidden_2 = match self.model.res_to_dit_proj.forward(&self.residual_hidden) {
-            Ok(t) => t,
-            Err(e) => return Some(Err(e.into())),
-        };
-        let dit_hidden = match dit_hidden_1.add(&dit_hidden_2) {
-            Ok(t) => t,
-            Err(e) => return Some(Err(e.into())),
-        };
-        let cond = match self.prefix_feat_cond.transpose(1, 2) {
-            Ok(t) => match t.contiguous() {
-                Ok(t) => t,
-                Err(e) => return Some(Err(e.into())),
-            },
             Err(e) => return Some(Err(e.into())),
         };
 
@@ -855,16 +892,18 @@ impl<'a> Iterator for VoxCPMInferenceStream<'a> {
             &dit_hidden,
             self.inference_timesteps,
             self.model.patch_size,
-            &cond,
+            &self.prefix_feat_cond,
             1.0,
             self.cfg_value,
             1.0,
             true,
         ) {
-            Ok(t) => match t.transpose(1, 2) {
-                Ok(t) => t,
-                Err(e) => return Some(Err(e.into())),
-            },
+            Ok(t) => t,
+            Err(e) => return Some(Err(e.into())),
+        };
+
+        let (b, p, d) = match pred_feat.dims3() {
+            Ok(dims) => dims,
             Err(e) => return Some(Err(e.into())),
         };
 
@@ -882,28 +921,26 @@ impl<'a> Iterator for VoxCPMInferenceStream<'a> {
         };
 
         self.prefix_feat_cond = pred_feat;
-        let stop_flag = match self.model.stop_proj.forward(&self.lm_hidden) {
-            Ok(t) => match t.silu() {
-                Ok(t) => match self.model.stop_head.forward(&t) {
-                    Ok(t) => match t.argmax(D::Minus1) {
-                        Ok(t) => match t.i(0) {
-                            Ok(t) => match t.to_scalar::<u32>() {
-                                Ok(v) => v,
-                                Err(e) => return Some(Err(e.into())),
-                            },
-                            Err(e) => return Some(Err(e.into())),
-                        },
+        if self.i > self.min_len {
+            // Optimize stop_flag check: avoid unnecessary silu/argmax if possible,
+            // but keep for correctness unless we have a faster way.
+            let stop_flag = match self.model.stop_proj.forward(&self.lm_hidden) {
+                Ok(t) => match t.silu().and_then(|t| self.model.stop_head.forward(&t)) {
+                    Ok(t) => match t
+                        .argmax(D::Minus1)
+                        .and_then(|t| t.i(0).and_then(|t| t.to_scalar::<u32>()))
+                    {
+                        Ok(v) => v,
                         Err(e) => return Some(Err(e.into())),
                     },
                     Err(e) => return Some(Err(e.into())),
                 },
                 Err(e) => return Some(Err(e.into())),
-            },
-            Err(e) => return Some(Err(e.into())),
-        };
+            };
 
-        if self.i > self.min_len && stop_flag == 1 {
-            self.finished = true;
+            if stop_flag == 1 {
+                self.finished = true;
+            }
         }
 
         self.position_id += self.seq_len;
@@ -911,7 +948,7 @@ impl<'a> Iterator for VoxCPMInferenceStream<'a> {
 
         let curr_embed_val = match curr_embed.i((.., 0, ..)) {
             Ok(t) => t,
-            Err(e) => return Some(Err(e.into())),
+            Err(e) => return Some(Err(anyhow::Error::from(e))),
         };
 
         self.lm_hidden = match self
@@ -919,14 +956,15 @@ impl<'a> Iterator for VoxCPMInferenceStream<'a> {
             .base_lm
             .forward_with_cache(&curr_embed_val, self.position_id)
         {
-            Ok(t) => match t.squeeze(1) {
-                Ok(t) => match self.model.fsq_layer.forward(&t) {
-                    Ok(t) => t,
-                    Err(e) => return Some(Err(e.into())),
-                },
-                Err(e) => return Some(Err(e.into())),
+            Ok(t) => match t
+                .squeeze(1)
+                .map_err(anyhow::Error::from)
+                .and_then(|t| self.model.fsq_layer.forward(&t))
+            {
+                Ok(t) => t,
+                Err(e) => return Some(Err(e)),
             },
-            Err(e) => return Some(Err(e.into())),
+            Err(e) => return Some(Err(anyhow::Error::from(e))),
         };
 
         self.residual_hidden = match self.lm_hidden.add(&curr_embed_val) {
@@ -937,15 +975,23 @@ impl<'a> Iterator for VoxCPMInferenceStream<'a> {
             {
                 Ok(t) => match t.squeeze(1) {
                     Ok(t) => t,
-                    Err(e) => return Some(Err(e.into())),
+                    Err(e) => return Some(Err(anyhow::Error::from(e))),
                 },
-                Err(e) => return Some(Err(e.into())),
+                Err(e) => return Some(Err(anyhow::Error::from(e))),
             },
-            Err(e) => return Some(Err(e.into())),
+            Err(e) => return Some(Err(anyhow::Error::from(e))),
         };
 
         self.i += 1;
-        Some(Ok(pred_feat_unsqueezed))
+
+        // Reshape to [B, D, P] directly if possible for VAE
+        match pred_feat_unsqueezed
+            .permute((0, 3, 1, 2))
+            .and_then(|t| t.reshape((b, d, p)))
+        {
+            Ok(t) => Some(Ok(t)),
+            Err(e) => Some(Err(anyhow::Error::from(e))),
+        }
     }
 }
 
@@ -975,19 +1021,10 @@ impl<'a> Iterator for VoxCPMGenerateStream<'a> {
         while let Some(next_latent) = self.inf_stream.next() {
             match next_latent {
                 Ok(latent) => {
-                    // latent: [B, 1, P, D]
-                    let (b, _, p, d) = match latent.dims4() {
+                    // latent: [B, D, P]
+                    let (b, _, _) = match latent.dims3() {
                         Ok(dims) => dims,
-                        Err(e) => return Some(Err(e.into())),
-                    };
-
-                    // Reshape to [B, D, P] for VAE
-                    let latent_vae = match latent
-                        .permute((0, 3, 1, 2))
-                        .and_then(|t| t.reshape((b, d, p)))
-                    {
-                        Ok(t) => t,
-                        Err(e) => return Some(Err(e.into())),
+                        Err(e) => return Some(Err(anyhow::Error::from(e))),
                     };
 
                     if self.vae_state.is_none() {
@@ -997,10 +1034,13 @@ impl<'a> Iterator for VoxCPMGenerateStream<'a> {
                             DType::F32,
                         ) {
                             Ok(s) => s,
-                            Err(e) => return Some(Err(e.into())),
+                            Err(e) => return Some(Err(anyhow::Error::from(e))),
                         };
                         self.vae_state = Some(state);
                     }
+
+                    // Reshape to [B, D, P] for VAE is now done in inf_stream.next()
+                    let latent_vae = latent;
 
                     if !self.skipped_first {
                         self.skipped_first = true;
@@ -1012,9 +1052,9 @@ impl<'a> Iterator for VoxCPMGenerateStream<'a> {
                         ) {
                             Ok(t) => match t.squeeze(1) {
                                 Ok(t) => t,
-                                Err(e) => return Some(Err(e.into())),
+                                Err(e) => return Some(Err(anyhow::Error::from(e))),
                             },
-                            Err(e) => return Some(Err(e.into())),
+                            Err(e) => return Some(Err(anyhow::Error::from(e))),
                         };
 
                         if let Some(to_yield) = self.pending_chunk.replace(audio_chunk) {
