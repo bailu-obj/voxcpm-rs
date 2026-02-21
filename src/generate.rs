@@ -234,6 +234,33 @@ impl VoxCPMGenerator {
         Ok(Box::new(iter))
     }
 
+    /// Streaming generation using prompt cache returning PCM samples (Vec<i16>)
+    pub fn generate_pcm_stream_use_prompt_cache(
+        &mut self,
+        target_text: String,
+        min_len: usize,
+        max_len: usize,
+        inference_timesteps: usize,
+        cfg_value: f64,
+        retry_badcase: bool,
+        retry_badcase_ratio_threshold: f64,
+    ) -> Result<Box<dyn Iterator<Item = Result<Vec<i16>>> + '_>> {
+        let stream = self.generate_stream_use_prompt_cache(
+            target_text,
+            min_len,
+            max_len,
+            inference_timesteps,
+            cfg_value,
+            retry_badcase,
+            retry_badcase_ratio_threshold,
+        )?;
+        let iter = stream.map(move |res| match res {
+            std::result::Result::Ok(tensor) => crate::utils::audio::to_pcm(&tensor),
+            Err(e) => Err(e),
+        });
+        Ok(Box::new(iter))
+    }
+
     /// Full inference with all parameters
     ///
     /// # Arguments
@@ -310,6 +337,11 @@ impl VoxCPMGenerator {
 
     pub fn to_wav(&self, audio: &Tensor) -> Result<Vec<u8>> {
         crate::utils::audio::to_wav(audio, self.sample_rate as u32)
+    }
+
+    /// Convert audio tensor to PCM samples (i16)
+    pub fn to_pcm(&self, audio: &Tensor) -> Result<Vec<i16>> {
+        crate::utils::audio::to_pcm(audio)
     }
 }
 
