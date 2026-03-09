@@ -294,7 +294,6 @@ impl UnifiedCFM {
     ) -> Result<Tensor> {
         let mut t = t_span.i(0)?;
         let mut dt = t.sub(&t_span.i(1)?)?;
-        let mut sol = Vec::new();
         let t_span_len = t_span.dim(0)?;
         let zero_init_steps = max(1, (t_span_len as f32 * 0.04) as usize);
         let mut x = x.to_owned();
@@ -328,7 +327,7 @@ impl UnifiedCFM {
                     let dphi_dt_combined = self
                         .estimator
                         .forward(&x_in, &mu_in, &t_in, &cond_in, &dt_in, true)?;
-                    let split = dphi_dt_combined.split(&[b, b], 0)?;
+                    let split = dphi_dt_combined.chunk(2, 0)?;
                     let dphi_dt_pos = split[0].contiguous()?;
                     let cfg_dphi_dt = split[1].contiguous()?;
 
@@ -352,12 +351,11 @@ impl UnifiedCFM {
             };
             x = x.broadcast_sub(&next_dphi_dt.broadcast_mul(&dt)?)?;
             t = t.sub(&dt)?;
-            sol.push(x.clone());
             if step < t_span_len - 1 {
                 dt = t.sub(&t_span.i(step + 1)?)?;
             }
         }
-        Ok(sol.into_iter().last().unwrap())
+        Ok(x)
     }
 }
 
