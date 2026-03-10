@@ -253,32 +253,25 @@ impl MiniCPMModel {
         is_causal: bool,
     ) -> Result<Tensor> {
         let (bs, seq_len, _) = input_embeds.dims3()?;
-        let attention_mask: Option<Tensor> = {
-            if !is_causal || seq_len <= 1 {
-                None
-            } else {
-                if let Some((cached_len, ref mask)) = self.mask_cache {
-                    if cached_len == seq_len {
-                        Some(mask.clone())
-                    } else {
-                        let mask =
-                            prepare_causal_attention_mask(bs, seq_len, 0, input_embeds.device())?;
-                        self.mask_cache = Some((seq_len, mask.clone()));
-                        Some(mask)
-                    }
-                } else {
-                    let mask =
-                        prepare_causal_attention_mask(bs, seq_len, 0, input_embeds.device())?;
-                    self.mask_cache = Some((seq_len, mask.clone()));
-                    Some(mask)
-                }
+        if is_causal && seq_len > 1 {
+            let need_new = self
+                .mask_cache
+                .as_ref()
+                .map_or(true, |(cached_len, _)| *cached_len != seq_len);
+            if need_new {
+                let mask =
+                    prepare_causal_attention_mask(bs, seq_len, 0, input_embeds.device())?;
+                self.mask_cache = Some((seq_len, mask));
             }
-        };
+        }
+        let attention_mask = self.mask_cache.as_ref().and_then(|(cached_len, mask)| {
+            (is_causal && seq_len > 1 && *cached_len == seq_len).then_some(mask)
+        });
         let (cos, sin) = self.rope_emb.forward(position_id, seq_len)?;
         let mut hidden_states = input_embeds.to_owned();
         for decode_layer in &self.layers {
             hidden_states =
-                decode_layer.forward(&hidden_states, &cos, &sin, attention_mask.as_ref())?;
+                decode_layer.forward(&hidden_states, &cos, &sin, attention_mask)?;
         }
         hidden_states = self.norm.forward(&hidden_states)?;
         Ok(hidden_states)
@@ -297,24 +290,22 @@ impl MiniCPMModel {
             xs.clone()
         };
 
-        let attention_mask: Option<Tensor> = if seq_len <= 1 {
-            None
-        } else {
-            if let Some((cached_len, ref mask)) = self.mask_cache {
-                if cached_len == seq_len {
-                    Some(mask.clone())
-                } else {
-                    let mask =
-                        prepare_causal_attention_mask(bs, seq_len, 0, hidden_states.device())?;
-                    self.mask_cache = Some((seq_len, mask.clone()));
-                    Some(mask)
-                }
-            } else {
-                let mask = prepare_causal_attention_mask(bs, seq_len, 0, hidden_states.device())?;
-                self.mask_cache = Some((seq_len, mask.clone()));
-                Some(mask)
+        if seq_len > 1 {
+            let need_new = self
+                .mask_cache
+                .as_ref()
+                .map_or(true, |(cached_len, _)| *cached_len != seq_len);
+            if need_new {
+                let mask =
+                    prepare_causal_attention_mask(bs, seq_len, 0, hidden_states.device())?;
+                self.mask_cache = Some((seq_len, mask));
             }
-        };
+        }
+        let attention_mask = self
+            .mask_cache
+            .as_ref()
+            .filter(|(cached_len, _)| *cached_len == seq_len)
+            .map(|(_, mask)| mask);
 
         let (cos, sin) = self.rope_emb.forward(position_id, seq_len)?;
         for decode_layer in &mut self.layers {
@@ -322,7 +313,7 @@ impl MiniCPMModel {
                 &hidden_states,
                 &cos,
                 &sin,
-                attention_mask.as_ref(),
+                attention_mask,
             )?;
         }
         hidden_states = self.norm.forward(&hidden_states)?;

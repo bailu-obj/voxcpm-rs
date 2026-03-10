@@ -29,7 +29,7 @@ impl CausalConv1d {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x_pad = x.pad_with_zeros(D::Minus1, self.padding * 2, 0)?;
+        let x_pad = x.pad_with_zeros(D::Minus1, self.padding * 2, 0)?.contiguous()?;
         let x = self.conv1d.forward(&x_pad)?;
         Ok(x)
     }
@@ -92,7 +92,7 @@ impl CausalConvTranspose1d {
         })
     }
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x = self.conv_transpose1d.forward(x)?;
+        let x = self.conv_transpose1d.forward(&x.contiguous()?)?;
         let last_dim = x.dim(D::Minus1)?;
         let select_num = last_dim.saturating_sub(self.padding * 2 - self.output_padding);
         let x = x.narrow(D::Minus1, 0, select_num)?;
@@ -235,12 +235,10 @@ impl Snake1d {
     }
 
     // x + sin(alpha*x)^2 / alpha
+    #[inline]
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x_out = x
-            .broadcast_mul(&self.alpha)?
-            .sin()?
-            .sqr()?
-            .broadcast_mul(&self.alpha_recip)?;
+        let ax = x.broadcast_mul(&self.alpha)?;
+        let x_out = ax.sin()?.sqr()?.broadcast_mul(&self.alpha_recip)?;
         Ok(x.add(&x_out)?)
     }
 }
@@ -407,7 +405,8 @@ impl CausalEncoder {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
-        let mut hidden_state = self.block0.forward(x)?;
+        let x = x.contiguous()?;
+        let mut hidden_state = self.block0.forward(&x)?;
         for block_i in &self.blocks {
             hidden_state = block_i.forward(&hidden_state)?;
         }
@@ -569,15 +568,15 @@ impl CausalDecoder {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x = self.model0.forward(x)?;
+        let x = x.contiguous()?;
+        let x = self.model0.forward(&x)?;
         let mut x = self.model1.forward(&x)?;
         for model_i in &self.models {
             x = model_i.forward(&x)?;
         }
         let x = self.model_minus_2.forward(&x)?;
         let x = self.model_minus_1.forward(&x)?;
-        let x = x.tanh()?;
-        Ok(x)
+        Ok(x.tanh()?)
     }
 
     pub fn forward_stream(&self, x: &Tensor, state: &mut DecoderState) -> Result<Tensor> {

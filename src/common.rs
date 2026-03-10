@@ -1,6 +1,6 @@
 use anyhow::Result;
 use candle_core::{Tensor, D};
-use candle_nn::{linear, linear_no_bias, Activation, Linear, Module, RmsNorm, VarBuilder};
+use candle_nn::{linear, linear_no_bias, Activation, Linear, Module, VarBuilder};
 
 use crate::position_embed::rope::apply_rotary_pos_emb;
 use crate::utils::tensor::repeat_kv;
@@ -257,13 +257,14 @@ pub fn eager_attention_forward(
     let attn_output = {
         #[cfg(not(feature = "flash-attn"))]
         {
-            // Ensure contiguous layout for matmul operations
+            // Contiguous layout improves matmul/conv on Metal and CPU.
             let query_states = query_states.contiguous()?;
             let key_states = key_states.contiguous()?;
             let value_states = value_states.contiguous()?;
+            let key_transposed = key_states.transpose(D::Minus2, D::Minus1)?.contiguous()?;
 
             let mut attn_weights = query_states
-                .matmul(&key_states.transpose(D::Minus2, D::Minus1)?)?
+                .matmul(&key_transposed)?
                 .affine(scaling, 0.0)?;
 
             if let Some(mask) = attention_mask {
