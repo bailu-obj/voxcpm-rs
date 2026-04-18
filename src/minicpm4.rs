@@ -158,7 +158,7 @@ impl MiniCPMDecoderLayer {
         let xs = self.input_layernorm.forward(xs)?;
         let xs = self
             .self_attn
-            .forward(&xs, Some(cos), Some(sin), attention_mask, true)?;
+            .forward(&xs, Some(cos), Some(sin), attention_mask, false)?;
         let xs = if let Some(scale) = self.mup_scale {
             (residual + xs.affine(scale, 0.0)?)?
         } else {
@@ -186,7 +186,7 @@ impl MiniCPMDecoderLayer {
         let xs = self.input_layernorm.forward(xs)?;
         let xs = self
             .self_attn
-            .forward_with_cache(&xs, cos, sin, attention_mask, true)?;
+            .forward_with_cache(&xs, cos, sin, attention_mask, false)?;
         let xs = if let Some(scale) = self.mup_scale {
             (residual + xs.affine(scale, 0.0)?)?
         } else {

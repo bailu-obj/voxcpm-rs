@@ -1,7 +1,6 @@
 use anyhow::Result;
 use candle_core::{DType, Device, IndexOp, Tensor, D};
 use candle_nn::{linear, linear_no_bias, Linear, Module, VarBuilder};
-use candle_transformers::models::deepseek2::SplitOp;
 use std::{cmp::max, collections::HashMap};
 
 use crate::{
@@ -48,7 +47,9 @@ impl ScalarQuantizationLayer {
 }
 
 pub struct SinusoidalPosEmb {
-    inv_freq: Tensor,
+    half_dim: usize,
+    /// `10000^(-2i/d)` pre-log exponent spacing: `-ln(10000) * i / (half_dim-1)` via arange + affine + exp.
+    inv_freq_log_step: f64,
     cached_inv_freq: Option<Tensor>,
 }
 
@@ -56,12 +57,10 @@ impl SinusoidalPosEmb {
     pub fn new(dim: usize) -> Result<Self> {
         assert_eq!(dim % 2, 0, "SinusoidalPosEmb requires dim to be even");
         let half_dim = dim / 2;
-        let dif = 10000.0_f64.ln() / (half_dim - 1) as f64;
-        let inv_freq = Tensor::arange(0.0, half_dim as f32, &Device::Cpu)?
-            .affine(-dif, 0.0)?
-            .exp()?;
+        let inv_freq_log_step = 10000.0_f64.ln() / (half_dim - 1) as f64;
         Ok(Self {
-            inv_freq,
+            half_dim,
+            inv_freq_log_step,
             cached_inv_freq: None,
         })
     }
@@ -76,15 +75,19 @@ impl SinusoidalPosEmb {
             || self.cached_inv_freq.as_ref().unwrap().device().location() != x.device().location()
             || self.cached_inv_freq.as_ref().unwrap().dtype() != x.dtype()
         {
-            self.cached_inv_freq = Some(self.inv_freq.to_device(x.device())?.to_dtype(x.dtype())?);
+            // Build `inv_freq` directly on the inference device (avoids a static CPU tensor + H2D on first use).
+            let inv_freq = Tensor::arange(0.0, self.half_dim as f32, x.device())?
+                .affine(-self.inv_freq_log_step, 0.0)?
+                .exp()?
+                .to_dtype(x.dtype())?;
+            self.cached_inv_freq = Some(inv_freq);
         }
         let inv_freq = self.cached_inv_freq.as_ref().unwrap();
 
         let emb = x
             .unsqueeze(1)?
-            .contiguous()?
             .affine(scale as f64, 0.0)?
-            .matmul(&inv_freq.unsqueeze(0)?.contiguous()?)?;
+            .matmul(&inv_freq.unsqueeze(0)?)?;
         let emb = Tensor::cat(&[emb.sin()?, emb.cos()?], D::Minus1)?;
         Ok(emb)
     }
@@ -127,6 +130,12 @@ pub struct VoxCPMLocDiT {
     time_mlp: TimestepEmbedding,
     delta_time_mlp: TimestepEmbedding,
     decoder: MiniCPMModel,
+    /// Cached output of `delta_time_mlp(time_embeddings(zeros))`.
+    /// When `mean_mode=false` in `UnifiedCFM`, `dt_in` is always all-zeros, making this
+    /// result a compile-time constant per forward session.  We lazily populate it on the
+    /// first call and reuse it for every subsequent Euler step, eliminating ~8 redundant
+    /// `SinusoidalPosEmb + TimestepEmbedding` dispatches per token step.
+    zero_dt_emb_cache: Option<Tensor>,
 }
 
 impl VoxCPMLocDiT {
@@ -157,6 +166,7 @@ impl VoxCPMLocDiT {
             time_mlp,
             delta_time_mlp,
             decoder,
+            zero_dt_emb_cache: None,
         })
     }
 
@@ -166,7 +176,8 @@ impl VoxCPMLocDiT {
         mu: &Tensor,
         t: &Tensor,
         cond: &Tensor,
-        dt: &Tensor,
+        // None = dt is all-zeros (mean_mode=false); embedding is cached. Some = mean_mode=true.
+        dt: Option<&Tensor>,
         cond_is_projected: bool,
     ) -> Result<Tensor> {
         let x = self.in_proj.forward(x)?;
@@ -179,9 +190,23 @@ impl VoxCPMLocDiT {
         let dtype = x.dtype();
         let t = self.time_embeddings.forward(t, 1000)?.to_dtype(dtype)?;
         let t = self.time_mlp.forward(&t)?;
-        let dt = self.time_embeddings.forward(dt, 1000)?.to_dtype(dtype)?;
-        let dt = self.delta_time_mlp.forward(&dt)?;
-        let t_total = t.add(&dt)?;
+        let dt_emb = match dt {
+            None => {
+                // dt is all-zeros: result is constant — compute once and reuse.
+                if self.zero_dt_emb_cache.is_none() {
+                    let b = t.dim(0)?;
+                    let zero_dt = Tensor::zeros(b, dtype, t.device())?;
+                    let emb = self.time_embeddings.forward(&zero_dt, 1000)?.to_dtype(dtype)?;
+                    self.zero_dt_emb_cache = Some(self.delta_time_mlp.forward(&emb)?);
+                }
+                self.zero_dt_emb_cache.as_ref().unwrap().clone()
+            }
+            Some(dt) => {
+                let emb = self.time_embeddings.forward(dt, 1000)?.to_dtype(dtype)?;
+                self.delta_time_mlp.forward(&emb)?
+            }
+        };
+        let t_total = t.add(&dt_emb)?;
 
         let x = Tensor::cat(&[mu.add(&t_total)?.unsqueeze(1)?, cond, x], 1)?;
         let hidden = self.decoder.forward(&x, 0, false)?;
@@ -319,28 +344,33 @@ impl UnifiedCFM {
                 } else {
                     let x_in = Tensor::cat(&[&x, &x], 0)?;
                     let t_in = t.broadcast_as(b2)?;
-                    let dt_in = if self.mean_mode {
-                        dt.broadcast_as(b2)?
+                    // When mean_mode=false, dt_in is always zeros; pass None so the
+                    // estimator can use its cached zero-dt embedding instead of
+                    // recomputing SinusoidalPosEmb + delta_time_mlp every Euler step.
+                    let dt_opt = if self.mean_mode {
+                        Some(dt.broadcast_as(b2)?)
                     } else {
-                        Tensor::zeros(b2, dtype, &device)?
+                        None
                     };
                     let dphi_dt_combined = self
                         .estimator
-                        .forward(&x_in, &mu_in, &t_in, &cond_in, &dt_in, true)?;
+                        .forward(&x_in, &mu_in, &t_in, &cond_in, dt_opt.as_ref(), true)?;
                     let split = dphi_dt_combined.chunk(2, 0)?;
                     let dphi_dt_pos = split[0].contiguous()?;
                     let cfg_dphi_dt = split[1].contiguous()?;
 
                     if cfg_value != 1.0 || use_cfg_zero_star {
-                        let mut st_star = Tensor::ones(1, dtype, &device)?;
-                        if use_cfg_zero_star {
+                        // Compute st_star: ones when cfg_zero_star is off, adaptive scale when on.
+                        let st_star = if use_cfg_zero_star {
                             let positive_flat = dphi_dt_pos.reshape((b, ()))?;
                             let negative_flat = cfg_dphi_dt.reshape((b, ()))?;
-                            st_star = self.optimized_scale(&positive_flat, &negative_flat)?;
+                            let scale = self.optimized_scale(&positive_flat, &negative_flat)?;
                             let mut vec_shape = vec![b];
                             vec_shape.extend(vec![1; dphi_dt_pos.rank() - 1]);
-                            st_star = st_star.reshape(vec_shape)?;
-                        }
+                            scale.reshape(vec_shape)?
+                        } else {
+                            Tensor::ones(1, dtype, &device)?
+                        };
                         let cfg = cfg_dphi_dt.broadcast_mul(&st_star)?;
                         cfg.add(&dphi_dt_pos.sub(&cfg)?.affine(cfg_value, 0.0)?)?
                             .contiguous()?
@@ -668,10 +698,14 @@ impl VoxCPMModel {
             inference_timesteps,
             cfg_value,
         )?;
-        let decode_audio = self
-            .audio_vae
-            .decode(&latent_pred.to_dtype(DType::F32)?)?
-            .squeeze(1)?;
+        // VAE weights are F32; skip a dtype kernel when the LM already produced F32 latents.
+        let decode_audio = match latent_pred.dtype() {
+            DType::F32 => self.audio_vae.decode(&latent_pred)?,
+            _ => self
+                .audio_vae
+                .decode(&latent_pred.to_dtype(DType::F32)?)?,
+        }
+        .squeeze(1)?;
         let audio_len = decode_audio.dim(D::Minus1)?;
         let decode_audio = decode_audio.narrow(D::Minus1, 640, audio_len - 1280)?;
         Ok(decode_audio)
@@ -723,8 +757,8 @@ impl VoxCPMModel {
         inference_timesteps: usize,
         cfg_value: f64,
     ) -> Result<Tensor> {
-        let mut pred_feat_seq = Vec::new();
-        self.inference_stream(
+        let mut pred_feat_seq = Vec::with_capacity(max_len);
+        for chunk in self.inference_stream(
             text,
             text_mask,
             feat,
@@ -733,19 +767,17 @@ impl VoxCPMModel {
             max_len,
             inference_timesteps,
             cfg_value,
-        )?
-        .for_each(|chunk| {
-            if let Ok(feat) = chunk {
-                pred_feat_seq.push(feat);
-            }
-        });
+        )? {
+            pred_feat_seq.push(chunk?);
+        }
 
-        let pred_seq = Tensor::cat(&pred_feat_seq, 1)?; // (b, t, p, d)
-        let (b, _, _, d) = pred_seq.dims4()?;
-        let feat_pred = pred_seq
-            .permute((0, 3, 1, 2))?
-            .reshape((b, d, ()))?
-            .contiguous()?;
+        if pred_feat_seq.is_empty() {
+            anyhow::bail!("inference produced no latent chunks");
+        }
+
+        // Each step is (B, D, P); stack along the latent time axis (last dim), not channel dim 1.
+        // `AudioVAE::decode` forces contiguous internally; avoid a duplicate full-tensor copy here.
+        let feat_pred = Tensor::cat(&pred_feat_seq, D::Minus1)?;
         self.base_lm.clear_kv_cache();
         self.residual_lm.clear_kv_cache();
         Ok(feat_pred)
@@ -778,10 +810,11 @@ impl VoxCPMModel {
             .unwrap()
             .forward(text)?
             .affine(scale_emb as f64, 0.0)?;
-        let combined_embed = text_mask
-            .unsqueeze(D::Minus1)?
+        let text_mask_bm = text_mask.unsqueeze(D::Minus1)?;
+        let feat_mask_bm = feat_mask.unsqueeze(D::Minus1)?;
+        let combined_embed = text_mask_bm
             .broadcast_mul(&text_embed)?
-            .add(&feat_mask.unsqueeze(D::Minus1)?.broadcast_mul(&feat_embed)?)?;
+            .add(&feat_mask_bm.broadcast_mul(&feat_embed)?)?;
         let prefix_feat_cond = feat.i((.., t - 1, ..))?;
 
         let position_id = 0;
@@ -792,13 +825,12 @@ impl VoxCPMModel {
         let enc_outputs = self
             .fsq_layer
             .forward(&enc_outputs)?
-            .broadcast_mul(&feat_mask.unsqueeze(D::Minus1)?)?
-            .add(&enc_outputs.broadcast_mul(&text_mask.unsqueeze(D::Minus1)?)?)?;
+            .broadcast_mul(&feat_mask_bm)?
+            .add(&enc_outputs.broadcast_mul(&text_mask_bm)?)?;
 
         let lm_hidden = enc_outputs.i((.., t - 1, ..))?;
 
-        let input_embeds =
-            enc_outputs.add(&feat_mask.unsqueeze(D::Minus1)?.broadcast_mul(&feat_embed)?)?;
+        let input_embeds = enc_outputs.add(&feat_mask_bm.broadcast_mul(&feat_embed)?)?;
         let residual_enc_outputs = self
             .residual_lm
             .forward_with_cache(&input_embeds, position_id)?;
@@ -900,11 +932,6 @@ impl<'a> Iterator for VoxCPMInferenceStream<'a> {
             Err(e) => return Some(Err(e.into())),
         };
 
-        let (b, p, d) = match pred_feat.dims3() {
-            Ok(dims) => dims,
-            Err(e) => return Some(Err(e.into())),
-        };
-
         let pred_feat_unsqueezed = match pred_feat.unsqueeze(1) {
             Ok(t) => t,
             Err(e) => return Some(Err(e.into())),
@@ -918,6 +945,10 @@ impl<'a> Iterator for VoxCPMInferenceStream<'a> {
             Err(e) => return Some(Err(e.into())),
         };
 
+        let vae_latent = match pred_feat.permute((0, 2, 1)) {
+            Ok(t) => t,
+            Err(e) => return Some(Err(e.into())),
+        };
         self.prefix_feat_cond = pred_feat;
         if self.i > self.min_len {
             // Optimize stop_flag check: avoid unnecessary silu/argmax if possible,
@@ -944,52 +975,49 @@ impl<'a> Iterator for VoxCPMInferenceStream<'a> {
         self.position_id += self.seq_len;
         self.seq_len = 1;
 
-        let curr_embed_val = match curr_embed.i((.., 0, ..)) {
-            Ok(t) => t,
-            Err(e) => return Some(Err(anyhow::Error::from(e))),
-        };
-
-        self.lm_hidden = match self
-            .model
-            .base_lm
-            .forward_with_cache(&curr_embed_val, self.position_id)
-        {
-            Ok(t) => match t
-                .squeeze(1)
-                .map_err(anyhow::Error::from)
-                .and_then(|t| self.model.fsq_layer.forward(&t))
-            {
+        // Skip LM decode when already finished: the next lm_hidden / residual_hidden
+        // would never be consumed, so computing them is pure waste.
+        if !self.finished {
+            let curr_embed_val = match curr_embed.i((.., 0, ..)) {
                 Ok(t) => t,
-                Err(e) => return Some(Err(e)),
-            },
-            Err(e) => return Some(Err(anyhow::Error::from(e))),
-        };
+                Err(e) => return Some(Err(anyhow::Error::from(e))),
+            };
 
-        self.residual_hidden = match self.lm_hidden.add(&curr_embed_val) {
-            Ok(t) => match self
+            self.lm_hidden = match self
                 .model
-                .residual_lm
-                .forward_with_cache(&t, self.position_id)
+                .base_lm
+                .forward_with_cache(&curr_embed_val, self.position_id)
             {
-                Ok(t) => match t.squeeze(1) {
+                Ok(t) => match t
+                    .squeeze(1)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|t| self.model.fsq_layer.forward(&t))
+                {
                     Ok(t) => t,
+                    Err(e) => return Some(Err(e)),
+                },
+                Err(e) => return Some(Err(anyhow::Error::from(e))),
+            };
+
+            self.residual_hidden = match self.lm_hidden.add(&curr_embed_val) {
+                Ok(t) => match self
+                    .model
+                    .residual_lm
+                    .forward_with_cache(&t, self.position_id)
+                {
+                    Ok(t) => match t.squeeze(1) {
+                        Ok(t) => t,
+                        Err(e) => return Some(Err(anyhow::Error::from(e))),
+                    },
                     Err(e) => return Some(Err(anyhow::Error::from(e))),
                 },
                 Err(e) => return Some(Err(anyhow::Error::from(e))),
-            },
-            Err(e) => return Some(Err(anyhow::Error::from(e))),
-        };
+            };
+        }
 
         self.i += 1;
 
-        // Reshape to [B, D, P] directly if possible for VAE
-        match pred_feat_unsqueezed
-            .permute((0, 3, 1, 2))
-            .and_then(|t| t.reshape((b, d, p)))
-        {
-            Ok(t) => Some(Ok(t)),
-            Err(e) => Some(Err(anyhow::Error::from(e))),
-        }
+        Some(Ok(vae_latent))
     }
 }
 

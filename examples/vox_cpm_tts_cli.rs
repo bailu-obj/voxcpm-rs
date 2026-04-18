@@ -1,5 +1,5 @@
 use anyhow::{bail, Result};
-use candle_core::Tensor;
+use candle_core::{Device, Tensor};
 use clap::Parser;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -10,8 +10,8 @@ use voxcpm_rs::VoxCPMGenerator;
 #[derive(Parser, Debug)]
 #[command(name = "voxcpm-cli", about = "VoxCPM TTS / Voice Cloning CLI")]
 struct Args {
-    /// Model path
-    #[arg(long, default_value = "./VoxCPM-0.5B")]
+    /// Model directory (config + weights)
+    #[arg(long, default_value = "models/VoxCPM-0.5B")]
     model: PathBuf,
 
     /// Reference wav (optional)
@@ -112,18 +112,23 @@ fn main() -> Result<()> {
             }
 
             let tensor = Tensor::cat(&chunks, 1)?;
-            let wav = generator.to_wav(&tensor)?;
-            let text_prefix = substring_by_char_count(text, 0, 4);
+            let tensor_cpu = tensor.to_device(&Device::Cpu)?;
+            let wav = generator.to_wav(&tensor_cpu)?;
+            let text_prefix = text_preview(text, 12);
 
             let time_cost = start.elapsed().as_secs_f64();
-            let audio_len = wav.len() as f64 / generator.sample_rate() as f64 / 2.0;
+            let audio_len = audio_duration_secs(&tensor_cpu, generator.sample_rate())?;
 
             total_audio_time += audio_len;
             total_time_cost += time_cost;
 
-            let rtf = time_cost / audio_len;
+            let rtf = if audio_len > 0.0 {
+                time_cost / audio_len
+            } else {
+                0.0
+            };
             println!(
-                "✓ Streaming finished for text {}... , using {:.2} seconds, output {:.2} seconds, rtf {:.2}\n",
+                "✓ Streaming finished for text {} , wall {:.2}s, audio {:.2}s, rtf {:.2}\n",
                 text_prefix, time_cost, audio_len, rtf,
             );
             let output = format!("{}_{}_stream.wav", args.out, i + 1);
@@ -138,7 +143,11 @@ fn main() -> Result<()> {
             "Average audio time: {:.2} seconds",
             total_audio_time / texts.len() as f64
         );
-        println!("Average rtf: {:.2}", total_time_cost / total_audio_time);
+        if total_audio_time > 0.0 {
+            println!("Average rtf: {:.2}", total_time_cost / total_audio_time);
+        } else {
+            println!("Average rtf: n/a");
+        }
     } else {
         // --------------------------------------------------
         // 🔹 Inference loop (NO cache init here)
@@ -162,20 +171,25 @@ fn main() -> Result<()> {
                 generator.generate_simple(text.clone())?
             };
 
-            let wav = generator.to_wav(&tensor)?;
-            let text_prefix = substring_by_char_count(text, 0, 4);
+            let tensor_cpu = tensor.to_device(&Device::Cpu)?;
+            let wav = generator.to_wav(&tensor_cpu)?;
+            let text_prefix = text_preview(text, 12);
 
             let time_cost = start.elapsed().as_secs_f64();
-            let audio_len = wav.len() as f64 / generator.sample_rate() as f64 / 2.0;
+            let audio_len = audio_duration_secs(&tensor_cpu, generator.sample_rate())?;
 
             total_audio_time += audio_len;
             total_time_cost += time_cost;
 
-            let rtf = time_cost / audio_len;
+            let rtf = if audio_len > 0.0 {
+                time_cost / audio_len
+            } else {
+                0.0
+            };
             println!(
-            "✓ Generated for text {}... , using {:.2} seconds, output {:.2} seconds, rtf {:.2}\n",
-            text_prefix, time_cost, audio_len, rtf,
-        );
+                "✓ Generated for text {} , wall {:.2}s, audio {:.2}s, rtf {:.2}\n",
+                text_prefix, time_cost, audio_len, rtf,
+            );
             let output = format!("{}_{}.wav", args.out, i + 1);
             std::fs::write(&output, wav)?;
             println!("✓ Saved {}\n", output);
@@ -188,7 +202,11 @@ fn main() -> Result<()> {
             "Average audio time: {:.2} seconds",
             total_audio_time / texts.len() as f64
         );
-        println!("Average rtf: {:.2}", total_time_cost / total_audio_time);
+        if total_audio_time > 0.0 {
+            println!("Average rtf: {:.2}", total_time_cost / total_audio_time);
+        } else {
+            println!("Average rtf: n/a");
+        }
     }
 
     Ok(())
@@ -223,20 +241,21 @@ fn read_lines(path: &PathBuf) -> Result<Vec<String>> {
     Ok(lines)
 }
 
-fn substring_by_char_count(s: &str, start_char: usize, char_count: usize) -> &str {
-    let mut byte_start = 0;
-    let mut byte_end = 0;
+/// Wall-clock seconds of mono audio from model output `(1, samples)` or `(samples,)`.
+fn audio_duration_secs(audio: &Tensor, sample_rate: usize) -> Result<f64> {
+    let n = match audio.dims().len() {
+        1 => audio.dim(0)?,
+        2 => audio.dim(1)?,
+        _ => bail!("expected audio rank 1 or 2, got {:?}", audio.dims()),
+    };
+    Ok(n as f64 / sample_rate as f64)
+}
 
-    for (i, char) in s.chars().enumerate() {
-        if i == start_char {
-            byte_start = byte_end;
-        }
-        byte_end += char.len_utf8();
-        if i == start_char + char_count - 1 {
-            // adjust for count vs index
-            break;
-        }
+fn text_preview(s: &str, max_chars: usize) -> String {
+    let t: String = s.chars().take(max_chars).collect();
+    if s.chars().count() > max_chars {
+        format!("{t}…")
+    } else {
+        t
     }
-
-    &s[byte_start..byte_end]
 }

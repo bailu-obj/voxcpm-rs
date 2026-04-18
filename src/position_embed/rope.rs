@@ -15,7 +15,7 @@ pub fn rotate_half(x: &Tensor) -> Result<Tensor> {
     let x1 = x.narrow(D::Minus1, 0, half_dim)?;
     let x2 = x.narrow(D::Minus1, half_dim, half_dim)?;
     let x2 = x2.affine(-1.0, 0.0)?;
-    let rotate_x = Tensor::cat(&[&x2, &x1], D::Minus1)?.contiguous()?;
+    let rotate_x = Tensor::cat(&[&x2, &x1], D::Minus1)?;
     Ok(rotate_x)
 }
 
