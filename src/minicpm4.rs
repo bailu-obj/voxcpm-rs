@@ -259,8 +259,7 @@ impl MiniCPMModel {
                 .as_ref()
                 .map_or(true, |(cached_len, _)| *cached_len != seq_len);
             if need_new {
-                let mask =
-                    prepare_causal_attention_mask(bs, seq_len, 0, input_embeds.device())?;
+                let mask = prepare_causal_attention_mask(bs, seq_len, 0, input_embeds.device())?;
                 self.mask_cache = Some((seq_len, mask));
             }
         }
@@ -270,8 +269,7 @@ impl MiniCPMModel {
         let (cos, sin) = self.rope_emb.forward(position_id, seq_len)?;
         let mut hidden_states = input_embeds.to_owned();
         for decode_layer in &self.layers {
-            hidden_states =
-                decode_layer.forward(&hidden_states, &cos, &sin, attention_mask)?;
+            hidden_states = decode_layer.forward(&hidden_states, &cos, &sin, attention_mask)?;
         }
         hidden_states = self.norm.forward(&hidden_states)?;
         Ok(hidden_states)
@@ -296,8 +294,7 @@ impl MiniCPMModel {
                 .as_ref()
                 .map_or(true, |(cached_len, _)| *cached_len != seq_len);
             if need_new {
-                let mask =
-                    prepare_causal_attention_mask(bs, seq_len, 0, hidden_states.device())?;
+                let mask = prepare_causal_attention_mask(bs, seq_len, 0, hidden_states.device())?;
                 self.mask_cache = Some((seq_len, mask));
             }
         }
@@ -309,12 +306,8 @@ impl MiniCPMModel {
 
         let (cos, sin) = self.rope_emb.forward(position_id, seq_len)?;
         for decode_layer in &mut self.layers {
-            hidden_states = decode_layer.forward_with_cache(
-                &hidden_states,
-                &cos,
-                &sin,
-                attention_mask,
-            )?;
+            hidden_states =
+                decode_layer.forward_with_cache(&hidden_states, &cos, &sin, attention_mask)?;
         }
         hidden_states = self.norm.forward(&hidden_states)?;
 

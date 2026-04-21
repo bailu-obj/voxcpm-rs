@@ -196,7 +196,10 @@ impl VoxCPMLocDiT {
                 if self.zero_dt_emb_cache.is_none() {
                     let b = t.dim(0)?;
                     let zero_dt = Tensor::zeros(b, dtype, t.device())?;
-                    let emb = self.time_embeddings.forward(&zero_dt, 1000)?.to_dtype(dtype)?;
+                    let emb = self
+                        .time_embeddings
+                        .forward(&zero_dt, 1000)?
+                        .to_dtype(dtype)?;
                     self.zero_dt_emb_cache = Some(self.delta_time_mlp.forward(&emb)?);
                 }
                 self.zero_dt_emb_cache.as_ref().unwrap().clone()
@@ -352,9 +355,14 @@ impl UnifiedCFM {
                     } else {
                         None
                     };
-                    let dphi_dt_combined = self
-                        .estimator
-                        .forward(&x_in, &mu_in, &t_in, &cond_in, dt_opt.as_ref(), true)?;
+                    let dphi_dt_combined = self.estimator.forward(
+                        &x_in,
+                        &mu_in,
+                        &t_in,
+                        &cond_in,
+                        dt_opt.as_ref(),
+                        true,
+                    )?;
                     let split = dphi_dt_combined.chunk(2, 0)?;
                     let dphi_dt_pos = split[0].contiguous()?;
                     let cfg_dphi_dt = split[1].contiguous()?;
@@ -701,9 +709,7 @@ impl VoxCPMModel {
         // VAE weights are F32; skip a dtype kernel when the LM already produced F32 latents.
         let decode_audio = match latent_pred.dtype() {
             DType::F32 => self.audio_vae.decode(&latent_pred)?,
-            _ => self
-                .audio_vae
-                .decode(&latent_pred.to_dtype(DType::F32)?)?,
+            _ => self.audio_vae.decode(&latent_pred.to_dtype(DType::F32)?)?,
         }
         .squeeze(1)?;
         let audio_len = decode_audio.dim(D::Minus1)?;

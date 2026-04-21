@@ -298,7 +298,7 @@ pub fn save_wav(audio: &Tensor, save_path: &str, sample_rate: u32) -> Result<()>
 
 pub fn to_wav(audio: &Tensor, sample_rate: u32) -> Result<Vec<u8>> {
     let pcm_data = to_pcm(audio)?;
-    
+
     let spec = hound::WavSpec {
         channels: 1,
         sample_rate,
@@ -325,11 +325,11 @@ pub fn to_pcm(audio: &Tensor) -> Result<Vec<i16>> {
     let ratio = if max > 1.0 { 32767.0 / max } else { 32767.0 };
     let audio = audio.squeeze(0)?;
     let audio_vec = audio.to_vec1::<f32>()?;
-    
+
     let pcm_data: Vec<i16> = audio_vec
         .into_iter()
         .map(|i| (i * ratio).round() as i16)
         .collect();
-    
+
     Ok(pcm_data)
 }

@@ -29,7 +29,9 @@ impl CausalConv1d {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x_pad = x.pad_with_zeros(D::Minus1, self.padding * 2, 0)?.contiguous()?;
+        let x_pad = x
+            .pad_with_zeros(D::Minus1, self.padding * 2, 0)?
+            .contiguous()?;
         let x = self.conv1d.forward(&x_pad)?;
         Ok(x)
     }

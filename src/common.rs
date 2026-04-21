@@ -128,11 +128,8 @@ impl NaiveAttention {
             )
         };
 
-        let fused_w = Tensor::cat(
-            &[q_proj.weight(), k_proj.weight(), v_proj.weight()],
-            0,
-        )?
-        .contiguous()?;
+        let fused_w =
+            Tensor::cat(&[q_proj.weight(), k_proj.weight(), v_proj.weight()], 0)?.contiguous()?;
         let fused_b = if bias {
             Some(
                 Tensor::cat(
@@ -316,13 +313,10 @@ fn eager_attention_inner(
         // Contiguous Q improves matmul on Metal/CUDA; K/V stay strided when possible.
         let query_states = query_states.contiguous()?;
         let key_transposed = key_states.transpose(D::Minus2, D::Minus1)?;
-        let mut attn_weights = query_states
-            .matmul(&key_transposed)?
-            .affine(scaling, 0.0)?;
+        let mut attn_weights = query_states.matmul(&key_transposed)?.affine(scaling, 0.0)?;
 
         if let Some(mask) = attention_mask {
-            attn_weights =
-                attn_weights.broadcast_add(&mask.to_dtype(attn_weights.dtype())?)?;
+            attn_weights = attn_weights.broadcast_add(&mask.to_dtype(attn_weights.dtype())?)?;
         }
 
         Ok(candle_nn::ops::softmax_last_dim(&attn_weights)?.matmul(value_states)?)
