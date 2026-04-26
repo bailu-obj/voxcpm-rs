@@ -14,9 +14,7 @@ pub fn rotate_half(x: &Tensor) -> Result<Tensor> {
     let half_dim = x.dim(D::Minus1)? / 2;
     let x1 = x.narrow(D::Minus1, 0, half_dim)?;
     let x2 = x.narrow(D::Minus1, half_dim, half_dim)?;
-    let x2 = x2.affine(-1.0, 0.0)?;
-    let rotate_x = Tensor::cat(&[&x2, &x1], D::Minus1)?;
-    Ok(rotate_x)
+    Ok(Tensor::cat(&[&x2.neg()?, &x1], D::Minus1)?)
 }
 
 pub fn apply_rotary_pos_emb(
@@ -36,19 +34,49 @@ pub fn apply_rotary_pos_emb(
         3 => (cos.unsqueeze(1)?, sin.unsqueeze(1)?),
         _ => (cos.clone(), sin.clone()),
     };
-    let orig_dtype = q.dtype();
-    let q = if tof32 { &q.to_dtype(DType::F32)? } else { q };
-    let k = if tof32 { &k.to_dtype(DType::F32)? } else { k };
-    let cos = cos.to_dtype(q.dtype())?;
-    let sin = sin.to_dtype(q.dtype())?;
 
-    let q_embed = q
-        .broadcast_mul(&cos)?
-        .add(&rotate_half(q)?.broadcast_mul(&sin)?)?
-        .to_dtype(orig_dtype)?;
-    let k_embed = k
-        .broadcast_mul(&cos)?
-        .add(&rotate_half(k)?.broadcast_mul(&sin)?)?
-        .to_dtype(orig_dtype)?;
-    Ok((q_embed, k_embed))
+    let orig_dtype = q.dtype();
+
+    // Only dispatch dtype-conversion kernels when they are actually needed.
+    // The unconditional `to_dtype` calls in the original fire Metal kernels even
+    // when the tensor is already the right type — across ~30 layers that is
+    // hundreds of no-op kernel dispatches per decode step.
+    let (q_work, k_work) = if tof32 && orig_dtype != DType::F32 {
+        (q.to_dtype(DType::F32)?, k.to_dtype(DType::F32)?)
+    } else {
+        (q.clone(), k.clone())
+    };
+
+    let cos = if cos.dtype() != q_work.dtype() {
+        cos.to_dtype(q_work.dtype())?
+    } else {
+        cos
+    };
+    let sin = if sin.dtype() != q_work.dtype() {
+        sin.to_dtype(q_work.dtype())?
+    } else {
+        sin
+    };
+
+    // Fuse q/k RoPE application into one tensor path:
+    // fewer kernel launches than doing q and k separately.
+    let q_heads = q_work.dim(1)?;
+    let k_heads = k_work.dim(1)?;
+    let qk = Tensor::cat(&[&q_work, &k_work], 1)?;
+    let qk_embed = rope_single(&qk, &cos, &sin)?;
+    let q_embed = qk_embed.narrow(1, 0, q_heads)?;
+    let k_embed = qk_embed.narrow(1, q_heads, k_heads)?;
+
+    // Only cast back if we actually elevated to F32 above.
+    if q_embed.dtype() != orig_dtype {
+        Ok((q_embed.to_dtype(orig_dtype)?, k_embed.to_dtype(orig_dtype)?))
+    } else {
+        Ok((q_embed, k_embed))
+    }
+}
+
+#[inline(always)]
+fn rope_single(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+    Ok(x.broadcast_mul(cos)?
+        .add(&rotate_half(x)?.broadcast_mul(sin)?)?)
 }

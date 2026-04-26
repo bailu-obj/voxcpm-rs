@@ -333,3 +333,24 @@ pub fn to_pcm(audio: &Tensor) -> Result<Vec<i16>> {
 
     Ok(pcm_data)
 }
+
+/// Convert a normalized streaming audio chunk to PCM samples without per-chunk peak normalization.
+///
+/// The VAE decoder ends with `tanh`, so generated samples are already expected to be in
+/// `[-1, 1]`. Avoiding `abs().max_all().to_scalar()` removes an extra Metal reduction and
+/// host synchronization from every streamed chunk.
+pub fn to_pcm_stream_chunk(audio: &Tensor) -> Result<Vec<i16>> {
+    assert_eq!(audio.dim(0)?, 1, "audio channel must be 1");
+    let audio = audio.squeeze(0)?;
+    let audio_vec = audio.to_vec1::<f32>()?;
+
+    let pcm_data: Vec<i16> = audio_vec
+        .into_iter()
+        .map(|sample| {
+            let sample = sample.clamp(-1.0, 1.0);
+            (sample * 32767.0).round() as i16
+        })
+        .collect();
+
+    Ok(pcm_data)
+}

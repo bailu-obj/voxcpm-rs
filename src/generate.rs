@@ -8,8 +8,67 @@ use crate::{
     config::{AudioVaeConfig, VoxCPMConfig},
     models::VoxCPMModel,
     tokenizer::SingleChineseTokenizer,
-    utils::device::{get_device, get_dtype},
+    utils::device::{get_compute_dtype, get_device, get_vae_compute_dtype},
 };
+
+const DEFAULT_INFERENCE_TIMESTEPS: usize = 10;
+pub const DEFAULT_STREAM_DECODE_LATENT_BATCH: usize = 4;
+
+#[derive(Debug, Clone, Copy)]
+pub struct VoxCPMGenerationConfig {
+    pub min_len: usize,
+    pub max_len: usize,
+    pub inference_timesteps: usize,
+    pub cfg_value: f64,
+    pub retry_badcase: bool,
+    pub retry_badcase_ratio_threshold: f64,
+    pub stream_decode_latent_batch: usize,
+}
+
+impl Default for VoxCPMGenerationConfig {
+    fn default() -> Self {
+        Self::voice_clone()
+    }
+}
+
+impl VoxCPMGenerationConfig {
+    pub fn simple() -> Self {
+        Self {
+            min_len: 2,
+            max_len: 100,
+            inference_timesteps: DEFAULT_INFERENCE_TIMESTEPS,
+            cfg_value: 2.0,
+            retry_badcase: true,
+            retry_badcase_ratio_threshold: 6.0,
+            stream_decode_latent_batch: DEFAULT_STREAM_DECODE_LATENT_BATCH,
+        }
+    }
+
+    pub fn voice_clone() -> Self {
+        Self {
+            min_len: 5,
+            max_len: 500,
+            inference_timesteps: DEFAULT_INFERENCE_TIMESTEPS,
+            cfg_value: 2.0,
+            retry_badcase: true,
+            retry_badcase_ratio_threshold: 3.0,
+            stream_decode_latent_batch: DEFAULT_STREAM_DECODE_LATENT_BATCH,
+        }
+    }
+
+    pub(crate) fn effective_max_len(self, target_text_len: usize) -> usize {
+        if self.retry_badcase {
+            self.max_len
+                .min((target_text_len as f64 * self.retry_badcase_ratio_threshold + 10.0) as usize)
+        } else {
+            self.max_len
+        }
+    }
+
+    pub(crate) fn stream_decode_latent_batch(self) -> usize {
+        self.stream_decode_latent_batch.max(1)
+    }
+}
 
 /// Main generator for VoxCPM text-to-speech
 pub struct VoxCPMGenerator {
@@ -25,7 +84,7 @@ impl VoxCPMGenerator {
     /// # Arguments
     /// * `path` - Path to model directory
     /// * `device` - Optional device (None for auto-detect)
-    /// * `dtype` - Optional data type (None for config default)
+    /// * `dtype` - Optional data type (None prefers F16 on GPU when the config is F32)
     pub fn new(path: &str, device: Option<&Device>, dtype: Option<DType>) -> Result<Self> {
         let device = &get_device(device);
         let config_path = path.to_string() + "/config.json";
@@ -44,6 +103,7 @@ impl VoxCPMGenerator {
             }
         }
 
+        let vae_dtype = get_vae_compute_dtype(dtype, vae_dtype, device);
         let vb_vae = VarBuilder::from_tensors(dict_to_hashmap, vae_dtype, device);
         let audio_config = match config.audio_vae_config.clone() {
             Some(config) => config,
@@ -74,7 +134,7 @@ impl VoxCPMGenerator {
         )?;
 
         let cfg_dtype = config.dtype.as_str();
-        let m_dtype = get_dtype(dtype, cfg_dtype);
+        let m_dtype = get_compute_dtype(dtype, cfg_dtype, device);
 
         // Load main model weights (. bin or .safetensors)
         let model_list = find_type_files(path, "bin")?;
@@ -117,38 +177,22 @@ impl VoxCPMGenerator {
     }
 
     /// Generate using cached prompt
-    pub fn generate_use_prompt_cache(
+    pub fn generate_with_config(
         &mut self,
         target_text: String,
-        min_len: usize,
-        max_len: usize,
-        inference_timesteps: usize,
-        cfg_value: f64,
-        retry_badcase: bool,
-        retry_badcase_ratio_threshold: f64,
+        config: VoxCPMGenerationConfig,
     ) -> Result<Tensor> {
-        match self.prompt_cache.take() {
-            Some(cache) => {
-                let audio = self.voxcpm.generate_with_prompt_cache(
-                    target_text,
-                    cache.clone(),
-                    min_len,
-                    max_len,
-                    inference_timesteps,
-                    cfg_value,
-                    retry_badcase,
-                    retry_badcase_ratio_threshold,
-                )?;
-                self.prompt_cache = Some(cache);
-                Ok(audio)
-            }
-            None => self.generate_simple(target_text),
+        match self.prompt_cache.as_ref() {
+            Some(cache) => self
+                .voxcpm
+                .generate_with_prompt_cache(target_text, cache, config),
+            None => self.voxcpm.generate(target_text, None, None, config),
         }
     }
 
     /// Simple generation with default parameters
     pub fn generate_simple(&mut self, target_text: String) -> Result<Tensor> {
-        self.inference(target_text, None, None, 2, 100, 10, 2.0, 6.0)
+        self.generate_with_config(target_text, VoxCPMGenerationConfig::simple())
     }
 
     /// Simple streaming generation with default parameters
@@ -156,37 +200,26 @@ impl VoxCPMGenerator {
         &mut self,
         target_text: String,
     ) -> Result<Box<dyn Iterator<Item = Result<Tensor>> + '_>> {
-        let iter = self.inference_stream(target_text, None, None, 2, 100, 10, 2.0, 6.0)?;
+        let iter =
+            self.generate_stream_with_config(target_text, VoxCPMGenerationConfig::simple())?;
         Ok(Box::new(iter))
     }
 
-    pub fn generate_stream_use_prompt_cache(
+    pub fn generate_stream_with_config(
         &mut self,
         target_text: String,
-        min_len: usize,
-        max_len: usize,
-        inference_timesteps: usize,
-        cfg_value: f64,
-        retry_badcase: bool,
-        retry_badcase_ratio_threshold: f64,
+        config: VoxCPMGenerationConfig,
     ) -> Result<Box<dyn Iterator<Item = Result<Tensor>> + '_>> {
-        match self.prompt_cache.take() {
-            Some(cache) => {
-                let iter = self.voxcpm.generate_stream_with_prompt_cache(
-                    target_text,
-                    cache.clone(),
-                    min_len,
-                    max_len,
-                    inference_timesteps,
-                    cfg_value,
-                    retry_badcase,
-                    retry_badcase_ratio_threshold,
-                )?;
-                self.prompt_cache = Some(cache);
-                Ok(Box::new(iter) as Box<dyn Iterator<Item = Result<Tensor>>>)
-            }
+        match self.prompt_cache.as_ref() {
+            Some(cache) => Ok(Box::new(self.voxcpm.generate_stream_with_prompt_cache(
+                target_text,
+                cache,
+                config,
+            )?) as Box<dyn Iterator<Item = Result<Tensor>>>),
             None => {
-                let iter = self.generate_stream_simple(target_text)?;
+                let iter = self
+                    .voxcpm
+                    .generate_stream(target_text, None, None, config)?;
                 Ok(Box::new(iter) as Box<dyn Iterator<Item = Result<Tensor>>>)
             }
         }
@@ -207,26 +240,13 @@ impl VoxCPMGenerator {
     }
 
     /// Streaming generation using prompt cache returning WAV bytes (Vec<u8>)
-    pub fn generate_wav_stream_use_prompt_cache(
+    pub fn generate_wav_stream_with_config(
         &mut self,
         target_text: String,
-        min_len: usize,
-        max_len: usize,
-        inference_timesteps: usize,
-        cfg_value: f64,
-        retry_badcase: bool,
-        retry_badcase_ratio_threshold: f64,
+        config: VoxCPMGenerationConfig,
     ) -> Result<Box<dyn Iterator<Item = Result<Vec<u8>>> + '_>> {
         let sample_rate = self.sample_rate as u32;
-        let stream = self.generate_stream_use_prompt_cache(
-            target_text,
-            min_len,
-            max_len,
-            inference_timesteps,
-            cfg_value,
-            retry_badcase,
-            retry_badcase_ratio_threshold,
-        )?;
+        let stream = self.generate_stream_with_config(target_text, config)?;
         let iter = stream.map(move |res| match res {
             std::result::Result::Ok(tensor) => crate::utils::audio::to_wav(&tensor, sample_rate),
             Err(e) => Err(e),
@@ -235,88 +255,16 @@ impl VoxCPMGenerator {
     }
 
     /// Streaming generation using prompt cache returning PCM samples (Vec<i16>)
-    pub fn generate_pcm_stream_use_prompt_cache(
+    pub fn generate_pcm_stream_with_config(
         &mut self,
         target_text: String,
-        min_len: usize,
-        max_len: usize,
-        inference_timesteps: usize,
-        cfg_value: f64,
-        retry_badcase: bool,
-        retry_badcase_ratio_threshold: f64,
+        config: VoxCPMGenerationConfig,
     ) -> Result<Box<dyn Iterator<Item = Result<Vec<i16>>> + '_>> {
-        let stream = self.generate_stream_use_prompt_cache(
-            target_text,
-            min_len,
-            max_len,
-            inference_timesteps,
-            cfg_value,
-            retry_badcase,
-            retry_badcase_ratio_threshold,
-        )?;
+        let stream = self.generate_stream_with_config(target_text, config)?;
         let iter = stream.map(move |res| match res {
-            std::result::Result::Ok(tensor) => crate::utils::audio::to_pcm(&tensor),
+            std::result::Result::Ok(tensor) => crate::utils::audio::to_pcm_stream_chunk(&tensor),
             Err(e) => Err(e),
         });
-        Ok(Box::new(iter))
-    }
-
-    /// Full inference with all parameters
-    ///
-    /// # Arguments
-    /// * `target_text` - Text to synthesize
-    /// * `prompt_text` - Optional reference text for voice cloning
-    /// * `prompt_wav_path` - Optional reference audio path
-    /// * `min_len` - Minimum generation length
-    /// * `max_len` - Maximum generation length
-    /// * `inference_timesteps` - Number of diffusion steps (higher = better quality)
-    /// * `cfg_value` - Classifier-free guidance value
-    /// * `retry_badcase_ratio_threshold` - Quality threshold
-    pub fn inference(
-        &mut self,
-        target_text: String,
-        prompt_text: Option<String>,
-        prompt_wav_path: Option<String>,
-        min_len: usize,
-        max_len: usize,
-        inference_timesteps: usize,
-        cfg_value: f64,
-        retry_badcase_ratio_threshold: f64,
-    ) -> Result<Tensor> {
-        self.voxcpm.generate(
-            target_text,
-            prompt_text,
-            prompt_wav_path,
-            min_len,
-            max_len,
-            inference_timesteps,
-            cfg_value,
-            retry_badcase_ratio_threshold,
-        )
-    }
-
-    /// Full streaming inference with all parameters
-    pub fn inference_stream(
-        &mut self,
-        target_text: String,
-        prompt_text: Option<String>,
-        prompt_wav_path: Option<String>,
-        min_len: usize,
-        max_len: usize,
-        inference_timesteps: usize,
-        cfg_value: f64,
-        retry_badcase_ratio_threshold: f64,
-    ) -> Result<Box<dyn Iterator<Item = Result<Tensor>> + '_>> {
-        let iter = self.voxcpm.generate_stream(
-            target_text,
-            prompt_text,
-            prompt_wav_path,
-            min_len,
-            max_len,
-            inference_timesteps,
-            cfg_value,
-            retry_badcase_ratio_threshold,
-        )?;
         Ok(Box::new(iter))
     }
 

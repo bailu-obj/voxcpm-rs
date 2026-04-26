@@ -13,6 +13,6 @@ pub mod tokenizer;
 pub mod utils;
 
 pub use config::{AudioVaeConfig, VoxCPMConfig};
-pub use generate::VoxCPMGenerator;
+pub use generate::{VoxCPMGenerationConfig, VoxCPMGenerator};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

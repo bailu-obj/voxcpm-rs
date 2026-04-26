@@ -5,7 +5,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::time::Instant;
-use voxcpm_rs::VoxCPMGenerator;
+use voxcpm_rs::{VoxCPMGenerationConfig, VoxCPMGenerator};
 
 #[derive(Parser, Debug)]
 #[command(name = "voxcpm-cli", about = "VoxCPM TTS / Voice Cloning CLI")]
@@ -63,6 +63,11 @@ fn main() -> Result<()> {
             false
         }
     };
+    let generation_config = if use_ref {
+        VoxCPMGenerationConfig::voice_clone()
+    } else {
+        VoxCPMGenerationConfig::simple()
+    };
 
     if args.stream {
         // --------------------------------------------------
@@ -75,19 +80,8 @@ fn main() -> Result<()> {
             let start = Instant::now();
             let mut first_chunk_time = None;
 
-            let stream: Box<dyn Iterator<Item = Result<Tensor>> + '_> = if use_ref {
-                Box::new(generator.generate_stream_use_prompt_cache(
-                    text.clone(),
-                    5,    // min_len
-                    500,  // max_len
-                    10,   // timesteps
-                    2.0,  // cfg
-                    true, // use cache
-                    3.0,  // retry threshold
-                )?)
-            } else {
-                Box::new(generator.generate_stream_simple(text.clone())?)
-            };
+            let stream: Box<dyn Iterator<Item = Result<Tensor>> + '_> =
+                Box::new(generator.generate_stream_with_config(text.clone(), generation_config)?);
 
             let mut chunks = Vec::new();
             for (_chunk_idx, chunk_res) in stream.enumerate() {
@@ -157,19 +151,7 @@ fn main() -> Result<()> {
         for (i, text) in texts.iter().enumerate() {
             println!("▶ Generating {}/{}", i + 1, texts.len());
             let start = Instant::now();
-            let tensor = if use_ref {
-                generator.generate_use_prompt_cache(
-                    text.clone(),
-                    5,    // min_len
-                    500,  // max_len
-                    10,   // timesteps
-                    2.0,  // cfg
-                    true, // use cache
-                    3.0,  // retry threshold
-                )?
-            } else {
-                generator.generate_simple(text.clone())?
-            };
+            let tensor = generator.generate_with_config(text.clone(), generation_config)?;
 
             let tensor_cpu = tensor.to_device(&Device::Cpu)?;
             let wav = generator.to_wav(&tensor_cpu)?;

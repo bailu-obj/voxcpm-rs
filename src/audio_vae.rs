@@ -36,12 +36,19 @@ impl CausalConv1d {
         Ok(x)
     }
 
+    /// Note: a reusable `[state|x]` pad buffer would need true in-place writes; Candle
+    /// `slice_assign` returns a fresh tensor each time, so `Tensor::cat` is kept here.
     pub fn forward_stream(&self, x: &Tensor, state: &mut Tensor) -> Result<Tensor> {
         // x: [B, C, L]
         // state: [B, C, P*2]
-        let x_pad = Tensor::cat(&[state as &Tensor, x], D::Minus1)?;
+        let state_len = state.dim(D::Minus1)?;
+        let x_pad = if state_len == 0 {
+            x.clone()
+        } else {
+            Tensor::cat(&[state as &Tensor, x], D::Minus1)?
+        };
         let x_out = self.conv1d.forward(&x_pad)?;
-        *state = x_pad.narrow(D::Minus1, x.dim(D::Minus1)?, state.dim(D::Minus1)?)?;
+        *state = x_pad.narrow(D::Minus1, x.dim(D::Minus1)?, state_len)?;
         Ok(x_out)
     }
 
@@ -113,18 +120,15 @@ impl CausalConvTranspose1d {
 
         let mut out = x_out.narrow(D::Minus1, 0, select_num)?;
         if overlap_len > 0 {
-            let add_len = overlap_len.min(select_num);
-            let a = out.narrow(D::Minus1, 0, add_len)?;
-            let b = state.narrow(D::Minus1, 0, add_len)?;
-            let sum = a.add(&b)?;
-            if select_num > add_len {
-                out = Tensor::cat(
-                    &[&sum, &out.narrow(D::Minus1, add_len, select_num - add_len)?],
-                    D::Minus1,
-                )?;
+            // Fold overlap add + tail into one elementwise add: state padded with zeros on the
+            // right so only the first min(overlap_len, select_num) positions contribute, matching
+            // the old narrow + add + cat path without an extra cat kernel.
+            let state_contrib = if select_num <= overlap_len {
+                state.narrow(D::Minus1, 0, select_num)?
             } else {
-                out = sum;
-            }
+                state.pad_with_zeros(D::Minus1, 0, select_num - overlap_len)?
+            };
+            out = out.add(&state_contrib)?;
         }
         *state = x_out.narrow(D::Minus1, select_num, out_len - select_num)?;
         Ok(out)
@@ -632,11 +636,30 @@ pub struct AudioVAE {
     hop_length: usize,
     encoder: CausalEncoder,
     decoder: CausalDecoder,
+    dtype: DType,
     pub sample_rate: usize,
     pub chunk_size: usize,
 }
 
 impl AudioVAE {
+    #[inline]
+    fn to_compute_dtype(&self, tensor: &Tensor) -> Result<Tensor> {
+        if tensor.dtype() == self.dtype {
+            Ok(tensor.clone())
+        } else {
+            Ok(tensor.to_dtype(self.dtype)?)
+        }
+    }
+
+    #[inline]
+    fn to_output_dtype(&self, tensor: Tensor) -> Result<Tensor> {
+        if tensor.dtype() == DType::F32 {
+            Ok(tensor)
+        } else {
+            Ok(tensor.to_dtype(DType::F32)?)
+        }
+    }
+
     pub fn new(
         vb: VarBuilder,
         encoder_dim: usize,
@@ -646,6 +669,7 @@ impl AudioVAE {
         decoder_rates: Vec<usize>,
         sample_rate: usize,
     ) -> Result<Self> {
+        let dtype = vb.dtype();
         let latent_dim = match laten_dim {
             Some(d) => d,
             None => encoder_dim * (2_usize.pow(encoder_rates.len() as u32)),
@@ -676,6 +700,7 @@ impl AudioVAE {
             hop_length,
             encoder,
             decoder,
+            dtype,
             sample_rate,
             chunk_size,
         })
@@ -695,22 +720,24 @@ impl AudioVAE {
     }
 
     pub fn decode(&self, z: &Tensor) -> Result<Tensor> {
-        let x = self.decoder.forward(z)?;
-        Ok(x)
+        let z = self.to_compute_dtype(z)?;
+        let x = self.decoder.forward(&z)?;
+        self.to_output_dtype(x)
     }
 
     pub fn decode_stream(&self, z: &Tensor, state: &mut DecoderState) -> Result<Tensor> {
-        let x = self.decoder.forward_stream(z, state)?;
-        Ok(x)
+        let z = self.to_compute_dtype(z)?;
+        let x = self.decoder.forward_stream(&z, state)?;
+        self.to_output_dtype(x)
     }
 
     pub fn init_decoder_state(
         &self,
         batch_size: usize,
         device: &Device,
-        dtype: DType,
+        _dtype: DType,
     ) -> Result<DecoderState> {
-        self.decoder.init_state(batch_size, device, dtype)
+        self.decoder.init_state(batch_size, device, self.dtype)
     }
 
     pub fn encode(&self, audio_data: &Tensor, sample_rate: Option<usize>) -> Result<Tensor> {
@@ -718,8 +745,65 @@ impl AudioVAE {
             2 => audio_data.unsqueeze(1)?,
             _ => audio_data.clone(),
         };
-        let audio_data = self.preprocess(&audio_data, sample_rate)?;
+        let audio_data = self.to_compute_dtype(&self.preprocess(&audio_data, sample_rate)?)?;
         let (_, mu, _) = self.encoder.forward(&audio_data)?;
         Ok(mu)
+    }
+}
+
+#[cfg(test)]
+mod streaming_overlap_tests {
+    use super::*;
+    use candle_core::Device;
+
+    fn legacy_overlap_merge(out: &Tensor, state: &Tensor, overlap_len: usize) -> Result<Tensor> {
+        let select_num = out.dim(D::Minus1)?;
+        if overlap_len == 0 {
+            return Ok(out.clone());
+        }
+        let add_len = overlap_len.min(select_num);
+        let a = out.narrow(D::Minus1, 0, add_len)?;
+        let b = state.narrow(D::Minus1, 0, add_len)?;
+        let sum = a.add(&b)?;
+        if select_num > add_len {
+            Ok(Tensor::cat(
+                &[&sum, &out.narrow(D::Minus1, add_len, select_num - add_len)?],
+                D::Minus1,
+            )?)
+        } else {
+            Ok(sum)
+        }
+    }
+
+    fn merged_overlap_add(out: &Tensor, state: &Tensor, overlap_len: usize) -> Result<Tensor> {
+        let select_num = out.dim(D::Minus1)?;
+        if overlap_len == 0 {
+            return Ok(out.clone());
+        }
+        let state_contrib = if select_num <= overlap_len {
+            state.narrow(D::Minus1, 0, select_num)?
+        } else {
+            state.pad_with_zeros(D::Minus1, 0, select_num - overlap_len)?
+        };
+        Ok(out.add(&state_contrib)?)
+    }
+
+    #[test]
+    fn causal_transpose_overlap_matches_legacy_cat() -> Result<()> {
+        let device = Device::Cpu;
+        for overlap_len in [1usize, 3, 7, 15] {
+            for select_num in 1usize..=24 {
+                let out = Tensor::randn(0f32, 1f32, (2, 4, select_num), &device)?;
+                let state = Tensor::randn(0f32, 1f32, (2, 4, overlap_len), &device)?;
+                let legacy = legacy_overlap_merge(&out, &state, overlap_len)?;
+                let merged = merged_overlap_add(&out, &state, overlap_len)?;
+                let max_abs = legacy.sub(&merged)?.abs()?.max_all()?.to_scalar::<f32>()?;
+                assert!(
+                    max_abs < 1e-5,
+                    "overlap_len={overlap_len} select_num={select_num} max_abs={max_abs}"
+                );
+            }
+        }
+        Ok(())
     }
 }
