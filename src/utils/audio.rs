@@ -271,6 +271,23 @@ pub fn load_audio_with_resample(
     Ok(audio)
 }
 
+/// Mono float samples to i16 with peak normalization (same rule everywhere we emit PCM).
+///
+/// If max(|x|) ≤ 1, scales by 32767 so the waveform uses full i16 range when peaks reach ±1.
+/// If any sample exceeds ±1, scales down proportionally so nothing clips (soft limiting).
+fn float_mono_to_i16_peak_normalized(samples: &[f32]) -> Vec<i16> {
+    let peak = samples.iter().copied().map(f32::abs).fold(0.0_f32, f32::max);
+    let scale = if peak > 1.0 {
+        32767.0 / peak
+    } else {
+        32767.0
+    };
+    samples
+        .iter()
+        .map(|&s| (s * scale).round() as i16)
+        .collect()
+}
+
 /// Save audio tensor to WAV file
 pub fn save_wav(audio: &Tensor, save_path: &str, sample_rate: u32) -> Result<()> {
     let spec = hound::WavSpec {
@@ -281,15 +298,12 @@ pub fn save_wav(audio: &Tensor, save_path: &str, sample_rate: u32) -> Result<()>
     };
 
     assert_eq!(audio.dim(0)?, 1, "audio channel must be 1");
-    let max = audio.abs()?.max_all()?;
-    let max = max.to_scalar::<f32>()?;
-    let ratio = if max > 1.0 { 32767.0 / max } else { 32767.0 };
     let audio = audio.squeeze(0)?;
     let audio_vec = audio.to_vec1::<f32>()?;
+    let pcm = float_mono_to_i16_peak_normalized(&audio_vec);
     let mut writer = hound::WavWriter::create(save_path, spec)?;
 
-    for i in audio_vec {
-        let sample_i16 = (i * ratio).round() as i16;
+    for sample_i16 in pcm {
         writer.write_sample(sample_i16)?;
     }
     writer.finalize()?;
@@ -320,37 +334,19 @@ pub fn to_wav(audio: &Tensor, sample_rate: u32) -> Result<Vec<u8>> {
 /// Convert audio tensor to PCM samples (i16)
 pub fn to_pcm(audio: &Tensor) -> Result<Vec<i16>> {
     assert_eq!(audio.dim(0)?, 1, "audio channel must be 1");
-    let max = audio.abs()?.max_all()?;
-    let max = max.to_scalar::<f32>()?;
-    let ratio = if max > 1.0 { 32767.0 / max } else { 32767.0 };
     let audio = audio.squeeze(0)?;
     let audio_vec = audio.to_vec1::<f32>()?;
-
-    let pcm_data: Vec<i16> = audio_vec
-        .into_iter()
-        .map(|i| (i * ratio).round() as i16)
-        .collect();
-
-    Ok(pcm_data)
+    Ok(float_mono_to_i16_peak_normalized(&audio_vec))
 }
 
-/// Convert a normalized streaming audio chunk to PCM samples without per-chunk peak normalization.
+/// Convert a streaming decode chunk to PCM samples (i16).
 ///
-/// The VAE decoder ends with `tanh`, so generated samples are already expected to be in
-/// `[-1, 1]`. Avoiding `abs().max_all().to_scalar()` removes an extra Metal reduction and
-/// host synchronization from every streamed chunk.
+/// Uses the same peak-normalization rule as [`to_pcm`], computed on the host slice after
+/// `to_vec1` (no extra GPU reduction per chunk). Overshoot beyond ±1 is scaled down for the
+/// whole chunk instead of hard-clipping each sample.
 pub fn to_pcm_stream_chunk(audio: &Tensor) -> Result<Vec<i16>> {
     assert_eq!(audio.dim(0)?, 1, "audio channel must be 1");
     let audio = audio.squeeze(0)?;
     let audio_vec = audio.to_vec1::<f32>()?;
-
-    let pcm_data: Vec<i16> = audio_vec
-        .into_iter()
-        .map(|sample| {
-            let sample = sample.clamp(-1.0, 1.0);
-            (sample * 32767.0).round() as i16
-        })
-        .collect();
-
-    Ok(pcm_data)
+    Ok(float_mono_to_i16_peak_normalized(&audio_vec))
 }
