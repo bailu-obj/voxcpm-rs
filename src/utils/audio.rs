@@ -276,12 +276,12 @@ pub fn load_audio_with_resample(
 /// If max(|x|) ≤ 1, scales by 32767 so the waveform uses full i16 range when peaks reach ±1.
 /// If any sample exceeds ±1, scales down proportionally so nothing clips (soft limiting).
 fn float_mono_to_i16_peak_normalized(samples: &[f32]) -> Vec<i16> {
-    let peak = samples.iter().copied().map(f32::abs).fold(0.0_f32, f32::max);
-    let scale = if peak > 1.0 {
-        32767.0 / peak
-    } else {
-        32767.0
-    };
+    let peak = samples
+        .iter()
+        .copied()
+        .map(f32::abs)
+        .fold(0.0_f32, f32::max);
+    let scale = if peak > 1.0 { 32767.0 / peak } else { 32767.0 };
     samples
         .iter()
         .map(|&s| (s * scale).round() as i16)
