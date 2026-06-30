@@ -23,7 +23,9 @@ pub struct MiniCPMLongRoPE {
 }
 impl MiniCPMLongRoPE {
     pub fn new(cfg: &VoxMiniCPM4Config, device: &Device, dtype: DType) -> Result<Self> {
-        let head_dim = cfg.hidden_size / cfg.num_attention_heads;
+        let head_dim = cfg
+            .kv_channels
+            .unwrap_or(cfg.hidden_size / cfg.num_attention_heads);
         let rope_theta = cfg.rope_theta;
         let short_factor = cfg.rope_scaling.short_factor.clone();
         let long_factor = cfg.rope_scaling.long_factor.clone();
@@ -37,8 +39,8 @@ impl MiniCPMLongRoPE {
         let max_seq_len_cached = max_position_embeddings;
         let t = Tensor::arange(0.0_f32, max_position_embeddings as f32, device)?
             .reshape((max_position_embeddings, 1))?;
-        // short_factor.len() = 32
-        // head_dim = 1024 / 16 = 64, inv_freq.len() = 32
+        // VoxCPM2 local encoder/decoder can use kv_channels larger than hidden/heads;
+        // RoPE must match the attention head dimension.
         let ext_factors = Tensor::from_slice(&short_factor, (1, short_factor.len()), device)?;
         let ext_factors = Tensor::ones_like(&ext_factors)?.div(&ext_factors)?;
         // (seq_len, 1) matmul (1, 32) -> (seq_len, 32) * (1, 32)-> (seq_len, 32)
@@ -110,12 +112,15 @@ pub struct MiniCPMDecoderLayer {
 
 impl MiniCPMDecoderLayer {
     pub fn new(vb: VarBuilder, cfg: &VoxMiniCPM4Config) -> Result<Self> {
+        let head_dim = cfg
+            .kv_channels
+            .unwrap_or(cfg.hidden_size / cfg.num_attention_heads);
         let self_attn = NaiveAttention::new(
             vb.pp("self_attn"),
             cfg.hidden_size,
             cfg.num_attention_heads,
             cfg.num_key_value_heads,
-            None,
+            Some(head_dim),
             false,
             None,
         )?;
@@ -150,15 +155,15 @@ impl MiniCPMDecoderLayer {
     pub fn forward(
         &self,
         xs: &Tensor,
-        cos: &Tensor,
-        sin: &Tensor,
+        cos: Option<&Tensor>,
+        sin: Option<&Tensor>,
         attention_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
         let residual = xs;
         let xs = self.input_layernorm.forward(xs)?;
         let xs = self
             .self_attn
-            .forward(&xs, Some(cos), Some(sin), attention_mask, false)?;
+            .forward(&xs, cos, sin, attention_mask, false)?;
         let xs = if let Some(scale) = self.mup_scale {
             (residual + xs.affine(scale, 0.0)?)?
         } else {
@@ -178,8 +183,8 @@ impl MiniCPMDecoderLayer {
     pub fn forward_with_cache(
         &mut self,
         xs: &Tensor,
-        cos: &Tensor,
-        sin: &Tensor,
+        cos: Option<&Tensor>,
+        sin: Option<&Tensor>,
         attention_mask: Option<&Tensor>,
     ) -> Result<Tensor> {
         let residual = xs;
@@ -211,7 +216,7 @@ pub struct MiniCPMModel {
     pub embed_tokens: Option<Embedding>,
     layers: Vec<MiniCPMDecoderLayer>,
     norm: RmsNorm,
-    rope_emb: MiniCPMLongRoPE,
+    rope_emb: Option<MiniCPMLongRoPE>,
     mask_cache: Option<(usize, Tensor)>,
 }
 
@@ -235,7 +240,11 @@ impl MiniCPMModel {
             layers.push(layer);
         }
         let norm = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("norm"))?;
-        let rope_emb = MiniCPMLongRoPE::new(&cfg, vb.device(), vb.dtype())?;
+        let rope_emb = if cfg.no_rope == Some(true) {
+            None
+        } else {
+            Some(MiniCPMLongRoPE::new(&cfg, vb.device(), vb.dtype())?)
+        };
         Ok(Self {
             // cfg,
             embed_tokens,
@@ -244,6 +253,15 @@ impl MiniCPMModel {
             rope_emb,
             mask_cache: None,
         })
+    }
+
+    fn rope_cos_sin(&mut self, position_id: usize, seq_len: usize) -> Result<(Option<Tensor>, Option<Tensor>)> {
+        if let Some(rope_emb) = &mut self.rope_emb {
+            let (cos, sin) = rope_emb.forward(position_id, seq_len)?;
+            Ok((Some(cos), Some(sin)))
+        } else {
+            Ok((None, None))
+        }
     }
 
     pub fn forward(
@@ -263,13 +281,14 @@ impl MiniCPMModel {
                 self.mask_cache = Some((seq_len, mask));
             }
         }
+        let (cos, sin) = self.rope_cos_sin(position_id, seq_len)?;
         let attention_mask = self.mask_cache.as_ref().and_then(|(cached_len, mask)| {
             (is_causal && seq_len > 1 && *cached_len == seq_len).then_some(mask)
         });
-        let (cos, sin) = self.rope_emb.forward(position_id, seq_len)?;
         let mut hidden_states = input_embeds.to_owned();
         for decode_layer in &self.layers {
-            hidden_states = decode_layer.forward(&hidden_states, &cos, &sin, attention_mask)?;
+            hidden_states =
+                decode_layer.forward(&hidden_states, cos.as_ref(), sin.as_ref(), attention_mask)?;
         }
         hidden_states = self.norm.forward(&hidden_states)?;
         Ok(hidden_states)
@@ -298,16 +317,16 @@ impl MiniCPMModel {
                 self.mask_cache = Some((seq_len, mask));
             }
         }
+        let (cos, sin) = self.rope_cos_sin(position_id, seq_len)?;
         let attention_mask = self
             .mask_cache
             .as_ref()
             .filter(|(cached_len, _)| *cached_len == seq_len)
             .map(|(_, mask)| mask);
 
-        let (cos, sin) = self.rope_emb.forward(position_id, seq_len)?;
         for decode_layer in &mut self.layers {
             hidden_states =
-                decode_layer.forward_with_cache(&hidden_states, &cos, &sin, attention_mask)?;
+                decode_layer.forward_with_cache(&hidden_states, cos.as_ref(), sin.as_ref(), attention_mask)?;
         }
         hidden_states = self.norm.forward(&hidden_states)?;
 

@@ -11,8 +11,9 @@ use crate::{
     utils::device::{get_compute_dtype, get_device, get_vae_compute_dtype},
 };
 
-const DEFAULT_INFERENCE_TIMESTEPS: usize = 10;
-pub const DEFAULT_STREAM_DECODE_LATENT_BATCH: usize = 4;
+const DEFAULT_INFERENCE_TIMESTEPS: usize = 8;
+pub const DEFAULT_STREAM_DECODE_LATENT_BATCH: usize = 8;
+const DEFAULT_STOP_CHECK_INTERVAL: usize = 4;
 
 #[derive(Debug, Clone, Copy)]
 pub struct VoxCPMGenerationConfig {
@@ -23,6 +24,8 @@ pub struct VoxCPMGenerationConfig {
     pub retry_badcase: bool,
     pub retry_badcase_ratio_threshold: f64,
     pub stream_decode_latent_batch: usize,
+    /// Run stop-head every N latents after `min_len` (1 = every step).
+    pub stop_check_interval: usize,
 }
 
 impl Default for VoxCPMGenerationConfig {
@@ -41,6 +44,7 @@ impl VoxCPMGenerationConfig {
             retry_badcase: true,
             retry_badcase_ratio_threshold: 6.0,
             stream_decode_latent_batch: DEFAULT_STREAM_DECODE_LATENT_BATCH,
+            stop_check_interval: DEFAULT_STOP_CHECK_INTERVAL,
         }
     }
 
@@ -53,6 +57,46 @@ impl VoxCPMGenerationConfig {
             retry_badcase: true,
             retry_badcase_ratio_threshold: 3.0,
             stream_decode_latent_batch: DEFAULT_STREAM_DECODE_LATENT_BATCH,
+            stop_check_interval: DEFAULT_STOP_CHECK_INTERVAL,
+        }
+    }
+
+    /// Lower TTFA: fewer Euler steps, smaller VAE batches, less frequent stop checks.
+    pub fn low_latency() -> Self {
+        Self {
+            min_len: 5,
+            max_len: 500,
+            inference_timesteps: 8,
+            cfg_value: 2.0,
+            retry_badcase: true,
+            retry_badcase_ratio_threshold: 3.0,
+            stream_decode_latent_batch: 2,
+            stop_check_interval: 2,
+        }
+    }
+
+    /// Adaptive Euler steps from target text length (short prompts use fewer steps).
+    pub fn adaptive_for_text_len(target_text_len: usize) -> Self {
+        let mut cfg = Self::voice_clone();
+        cfg.inference_timesteps = match target_text_len {
+            0..=20 => 6,
+            21..=60 => 8,
+            _ => 8,
+        };
+        cfg
+    }
+
+    /// Metal GPU RTF preset: fewer Euler steps, less frequent stop syncs, larger VAE batches.
+    pub fn metal_rtf() -> Self {
+        Self {
+            min_len: 5,
+            max_len: 500,
+            inference_timesteps: 8,
+            cfg_value: 2.0,
+            retry_badcase: true,
+            retry_badcase_ratio_threshold: 3.0,
+            stream_decode_latent_batch: 8,
+            stop_check_interval: 4,
         }
     }
 
@@ -90,21 +134,31 @@ impl VoxCPMGenerator {
         let config_path = path.to_string() + "/config.json";
         let config: VoxCPMConfig = serde_json::from_slice(&std::fs::read(config_path)?)?;
 
-        // Load VAE weights (PyTorch . pth files)
-        let model_list = find_type_files(path, "pth")?;
-        let mut dict_to_hashmap = HashMap::new();
-        let mut vae_dtype = DType::F32;
+        // Load VAE weights: prefer mmap safetensors (e.g. `*vae*.safetensors`), else PyTorch `.pth`.
+        let vae_safetensors = find_vae_safetensors(path)?;
+        let (vb_vae, _vae_dtype) = if !vae_safetensors.is_empty() {
+            let vae_dtype = get_vae_compute_dtype(dtype, DType::F32, device);
+            let vb = unsafe { VarBuilder::from_mmaped_safetensors(&vae_safetensors, vae_dtype, device)? };
+            (vb, vae_dtype)
+        } else {
+            let model_list = find_type_files(path, "pth")?;
+            let mut dict_to_hashmap = HashMap::new();
+            let mut vae_dtype = DType::F32;
 
-        for m in model_list {
-            let dict = read_all_with_key(m, Some("state_dict"))?;
-            vae_dtype = dict[0].1.dtype();
-            for (k, v) in dict {
-                dict_to_hashmap.insert(k, v);
+            for m in model_list {
+                let dict = read_all_with_key(m, Some("state_dict"))?;
+                vae_dtype = dict[0].1.dtype();
+                for (k, v) in dict {
+                    dict_to_hashmap.insert(k, v);
+                }
             }
-        }
 
-        let vae_dtype = get_vae_compute_dtype(dtype, vae_dtype, device);
-        let vb_vae = VarBuilder::from_tensors(dict_to_hashmap, vae_dtype, device);
+            let vae_dtype = get_vae_compute_dtype(dtype, vae_dtype, device);
+            (
+                VarBuilder::from_tensors(dict_to_hashmap, vae_dtype, device),
+                vae_dtype,
+            )
+        };
         let audio_config = match config.audio_vae_config.clone() {
             Some(config) => config,
             None => AudioVaeConfig {
@@ -114,13 +168,27 @@ impl VoxCPMGenerator {
                 decoder_dim: 1536,
                 decoder_rates: vec![8, 8, 5, 2],
                 sample_rate: 16000,
+                out_sample_rate: None,
+                sr_bin_boundaries: None,
             },
         };
 
-        let model_name = if audio_config.sample_rate == 16000 {
+        let out_sample_rate = audio_config
+            .out_sample_rate
+            .unwrap_or(audio_config.sample_rate);
+
+        let model_name = if config.is_voxcpm2() {
+            "VoxCPM2".to_string()
+        } else if audio_config.sample_rate == 16000 {
             "VoxCPM".to_string()
         } else {
             "VoxCPM1.5".to_string()
+        };
+
+        let cond_type = if config.is_voxcpm2() {
+            Some("scale_bias".to_string())
+        } else {
+            None
         };
 
         let audio_vae = AudioVAE::new(
@@ -131,6 +199,9 @@ impl VoxCPMGenerator {
             audio_config.decoder_dim,
             audio_config.decoder_rates.clone(),
             audio_config.sample_rate,
+            out_sample_rate,
+            audio_config.sr_bin_boundaries.clone(),
+            cond_type,
         )?;
 
         let cfg_dtype = config.dtype.as_str();
@@ -140,9 +211,13 @@ impl VoxCPMGenerator {
         let model_list = find_type_files(path, "bin")?;
         let vb_voxcpm = if model_list.is_empty() {
             let model_list = find_type_files(path, "safetensors")?;
-            unsafe { VarBuilder::from_mmaped_safetensors(&model_list, m_dtype, device)? }
+            let main_st: Vec<String> = model_list
+                .into_iter()
+                .filter(|p| !p.to_lowercase().contains("vae"))
+                .collect();
+            unsafe { VarBuilder::from_mmaped_safetensors(&main_st, m_dtype, device)? }
         } else {
-            dict_to_hashmap = HashMap::new();
+            let mut dict_to_hashmap = HashMap::new();
             for m in model_list {
                 let dict = read_all_with_key(m, Some("state_dict"))?;
                 for (k, v) in dict {
@@ -158,7 +233,7 @@ impl VoxCPMGenerator {
         Ok(Self {
             voxcpm,
             prompt_cache: None,
-            sample_rate: audio_config.sample_rate,
+            sample_rate: out_sample_rate,
             model_name,
         })
     }
@@ -306,4 +381,12 @@ fn find_type_files(path: &str, file_type: &str) -> Result<Vec<String>> {
         }
     }
     Ok(files)
+}
+
+/// Safetensors files whose path contains `vae` (case-insensitive), for mmap VAE load.
+fn find_vae_safetensors(path: &str) -> Result<Vec<String>> {
+    Ok(find_type_files(path, "safetensors")?
+        .into_iter()
+        .filter(|p| p.to_lowercase().contains("vae"))
+        .collect())
 }

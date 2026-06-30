@@ -35,8 +35,10 @@ fn dtype_from_str(dtype: &str) -> DType {
 
 fn lower_precision_dtype_for_device(device: &Device) -> Option<DType> {
     match device.location() {
-        DeviceLocation::Cuda { .. } => Some(DType::F16),
-        DeviceLocation::Metal { .. } | DeviceLocation::Cpu => None,
+        // Main model (LM/DiT): F16 halves matmul bandwidth on GPU.
+        // VAE conv path stays F32 via `vae_dtype_for_device` / `get_vae_compute_dtype`.
+        DeviceLocation::Cuda { .. } | DeviceLocation::Metal { .. } => Some(DType::F16),
+        DeviceLocation::Cpu => None,
     }
 }
 

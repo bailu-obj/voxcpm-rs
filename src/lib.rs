@@ -6,13 +6,16 @@ pub mod audio_vae;
 pub mod common;
 pub mod config;
 pub mod generate;
+pub mod kv_cache;
 pub mod minicpm4;
 pub mod models;
 pub mod position_embed;
+pub mod profile;
 pub mod tokenizer;
 pub mod utils;
 
 pub use config::{AudioVaeConfig, VoxCPMConfig};
 pub use generate::{VoxCPMGenerationConfig, VoxCPMGenerator};
+pub use profile::BenchmarkMetrics;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

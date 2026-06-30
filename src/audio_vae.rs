@@ -1,6 +1,8 @@
-use anyhow::{Ok, Result};
+use anyhow::{Ok, Result, anyhow};
 use candle_core::{DType, Device, Tensor, D};
-use candle_nn::{Conv1d, Conv1dConfig, ConvTranspose1d, ConvTranspose1dConfig, Module, VarBuilder};
+use candle_nn::{Conv1d, Conv1dConfig, ConvTranspose1d, ConvTranspose1dConfig, Embedding, Module, VarBuilder, embedding};
+
+use crate::utils::bucketize;
 
 pub struct CausalConv1d {
     conv1d: Conv1d,
@@ -516,12 +518,64 @@ impl CausalDecoderBlock {
     }
 }
 
+pub struct SampleRateConditionLayer {
+    cond_type: String,
+    scale_embed: Option<Embedding>,
+    bias_embed: Option<Embedding>,
+    cond_embed: Option<Embedding>,
+}
+
+impl SampleRateConditionLayer {
+    pub fn new(
+        vb: VarBuilder,
+        input_dim: usize,
+        sr_bin_buckets_len: usize,
+        cond_type: String,
+    ) -> Result<Self> {
+        let (scale_embed, bias_embed, cond_embed) = if cond_type.contains("scale_bias") {
+            let scale_embed = embedding(sr_bin_buckets_len, input_dim, vb.pp("scale_embed"))?;
+            let bias_embed = embedding(sr_bin_buckets_len, input_dim, vb.pp("bias_embed"))?;
+            (Some(scale_embed), Some(bias_embed), None)
+        } else if cond_type.eq("add") {
+            let cond_embed = embedding(sr_bin_buckets_len, input_dim, vb.pp("cond_embed"))?;
+            (None, None, Some(cond_embed))
+        } else {
+            (None, None, None)
+        };
+        Ok(Self {
+            cond_type,
+            scale_embed,
+            bias_embed,
+            cond_embed,
+        })
+    }
+
+    pub fn forward(&self, x: &Tensor, sr_cond: &Tensor) -> Result<Tensor> {
+        if self.cond_type.contains("scale_bias") {
+            if let Some(scale_embed) = &self.scale_embed {
+                if let Some(bias_embed) = &self.bias_embed {
+                    return Ok(x
+                        .broadcast_mul(&scale_embed.forward(sr_cond)?.unsqueeze(D::Minus1)?)?
+                        .broadcast_add(&bias_embed.forward(sr_cond)?.unsqueeze(D::Minus1)?)?);
+                }
+            }
+        } else if self.cond_type.eq("add") {
+            if let Some(cond_embed) = &self.cond_embed {
+                return Ok(x.broadcast_add(&cond_embed.forward(sr_cond)?.unsqueeze(D::Minus1)?)?);
+            }
+        }
+        Err(anyhow!("unsupported cond_type: {}", self.cond_type))
+    }
+}
+
 pub struct CausalDecoder {
     model0: WNCausalConv1d,
     model1: WNCausalConv1d,
     models: Vec<CausalDecoderBlock>,
     model_minus_2: Snake1d,
     model_minus_1: WNCausalConv1d,
+    sr_bin_boundaries: Option<Vec<usize>>,
+    sr_cond_model: Option<Vec<SampleRateConditionLayer>>,
 }
 
 impl CausalDecoder {
@@ -532,6 +586,8 @@ impl CausalDecoder {
         rates: Vec<usize>,
         d_out: usize,
         depthwise: bool,
+        sr_bin_boundaries: Option<Vec<usize>>,
+        cond_type: Option<String>,
     ) -> Result<Self> {
         let model0 = WNCausalConv1d::new(
             vb.pp("model.0"),
@@ -547,8 +603,10 @@ impl CausalDecoder {
         let vb_model = vb.pp("model");
         let mut output_dim = channels;
         let mut models = Vec::new();
+        let mut input_channels_vec = vec![];
         for (i, stride) in rates.iter().enumerate() {
             let input_dim = channels / 2_usize.pow(i as u32);
+            input_channels_vec.push(input_dim);
             output_dim = channels / 2_usize.pow((i + 1) as u32);
             let groups = if depthwise { output_dim } else { 1 };
             let model_i = CausalDecoderBlock::new(
@@ -564,32 +622,97 @@ impl CausalDecoder {
         let model_minus_2 = Snake1d::new(vb_model.pp(idx), output_dim)?;
         let model_minus_1 =
             WNCausalConv1d::new(vb_model.pp(idx + 1), output_dim, d_out, 7, 1, 3, 1, 1)?;
+        let (sr_cond_model, sr_bin_boundaries) =
+            if let Some(sr) = sr_bin_boundaries.clone() {
+                if let Some(cond_type) = cond_type {
+                    let sr_len = sr.len() + 1;
+                    let vb_sr = vb.pp("sr_cond_model");
+                    let mut sr_cond_model = vec![];
+                    for (i, &input_dim) in input_channels_vec.iter().enumerate() {
+                        let layer = SampleRateConditionLayer::new(
+                            vb_sr.pp(i + 2),
+                            input_dim,
+                            sr_len,
+                            cond_type.clone(),
+                        )?;
+                        sr_cond_model.push(layer);
+                    }
+                    (Some(sr_cond_model), Some(sr))
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            };
         Ok(Self {
             model0,
             model1,
             models,
             model_minus_2,
             model_minus_1,
+            sr_bin_boundaries,
+            sr_cond_model,
         })
     }
 
-    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x = x.contiguous()?;
-        let x = self.model0.forward(&x)?;
+    fn sr_cond_tensor(&self, sr_cond: Option<usize>, device: &Device) -> Result<Option<Tensor>> {
+        let Some(sr_cond) = sr_cond else {
+            return Ok(None);
+        };
+        let Some(boundaries) = &self.sr_bin_boundaries else {
+            return Ok(None);
+        };
+        let sr = bucketize(sr_cond, boundaries)?;
+        Ok(Some(Tensor::new(vec![sr as u32], device)?))
+    }
+
+    pub fn forward(&self, x: &Tensor, sr_cond: Option<usize>) -> Result<Tensor> {
+        let x = self.model0.forward(x)?;
         let mut x = self.model1.forward(&x)?;
-        for model_i in &self.models {
-            x = model_i.forward(&x)?;
+        if let Some(sr_cond_tensor) = self.sr_cond_tensor(sr_cond, x.device())? {
+            if let Some(sr_models) = &self.sr_cond_model {
+                for (model_i, sr_model_i) in self.models.iter().zip(sr_models.iter()) {
+                    x = sr_model_i.forward(&x, &sr_cond_tensor)?;
+                    x = model_i.forward(&x)?;
+                }
+            } else {
+                for model_i in &self.models {
+                    x = model_i.forward(&x)?;
+                }
+            }
+        } else {
+            for model_i in &self.models {
+                x = model_i.forward(&x)?;
+            }
         }
         let x = self.model_minus_2.forward(&x)?;
         let x = self.model_minus_1.forward(&x)?;
         Ok(x.tanh()?)
     }
 
-    pub fn forward_stream(&self, x: &Tensor, state: &mut DecoderState) -> Result<Tensor> {
+    pub fn forward_stream(
+        &self,
+        x: &Tensor,
+        state: &mut DecoderState,
+        sr_cond: Option<usize>,
+    ) -> Result<Tensor> {
         let mut x = self.model0.forward_stream(x, &mut state.model0_state)?;
         x = self.model1.forward_stream(&x, &mut state.model1_state)?;
-        for (i, model_i) in self.models.iter().enumerate() {
-            x = model_i.forward_stream(&x, &mut state.block_states[i])?;
+        if let Some(sr_cond_tensor) = self.sr_cond_tensor(sr_cond, x.device())? {
+            if let Some(sr_models) = &self.sr_cond_model {
+                for (i, model_i) in self.models.iter().enumerate() {
+                    x = sr_models[i].forward(&x, &sr_cond_tensor)?;
+                    x = model_i.forward_stream(&x, &mut state.block_states[i])?;
+                }
+            } else {
+                for (i, model_i) in self.models.iter().enumerate() {
+                    x = model_i.forward_stream(&x, &mut state.block_states[i])?;
+                }
+            }
+        } else {
+            for (i, model_i) in self.models.iter().enumerate() {
+                x = model_i.forward_stream(&x, &mut state.block_states[i])?;
+            }
         }
         x = self.model_minus_2.forward(&x)?;
         x = self
@@ -628,16 +751,13 @@ pub struct DecoderState {
 pub type DecoderBlockState = Vec<Vec<Tensor>>; // [block1, block2, block3] states
 
 pub struct AudioVAE {
-    // encoder_dim: usize,
-    // encoder_rates: Vec<usize>,
-    // decoder_dim: usize,
-    // decoder_rates: Vec<usize>,
     pub latent_dim: usize,
     hop_length: usize,
     encoder: CausalEncoder,
     decoder: CausalDecoder,
     dtype: DType,
     pub sample_rate: usize,
+    pub out_sample_rate: usize,
     pub chunk_size: usize,
 }
 
@@ -668,6 +788,9 @@ impl AudioVAE {
         decoder_dim: usize,
         decoder_rates: Vec<usize>,
         sample_rate: usize,
+        out_sample_rate: usize,
+        sr_bin_boundaries: Option<Vec<usize>>,
+        cond_type: Option<String>,
     ) -> Result<Self> {
         let dtype = vb.dtype();
         let latent_dim = match laten_dim {
@@ -689,19 +812,18 @@ impl AudioVAE {
             decoder_rates.clone(),
             1,
             true,
+            sr_bin_boundaries,
+            cond_type,
         )?;
         let chunk_size = hop_length;
         Ok(Self {
-            // encoder_dim,
-            // encoder_rates,
-            // decoder_dim,
-            // decoder_rates,
             latent_dim,
             hop_length,
             encoder,
             decoder,
             dtype,
             sample_rate,
+            out_sample_rate,
             chunk_size,
         })
     }
@@ -719,15 +841,30 @@ impl AudioVAE {
         Ok(audio_data)
     }
 
-    pub fn decode(&self, z: &Tensor) -> Result<Tensor> {
+    pub fn decode(&self, z: &Tensor, sr_cond: Option<usize>) -> Result<Tensor> {
         let z = self.to_compute_dtype(z)?;
-        let x = self.decoder.forward(&z)?;
+        let sr_cond = if sr_cond.is_none() && self.decoder.sr_bin_boundaries.is_some() {
+            Some(self.out_sample_rate)
+        } else {
+            sr_cond
+        };
+        let x = self.decoder.forward(&z, sr_cond)?;
         self.to_output_dtype(x)
     }
 
-    pub fn decode_stream(&self, z: &Tensor, state: &mut DecoderState) -> Result<Tensor> {
+    pub fn decode_stream(
+        &self,
+        z: &Tensor,
+        state: &mut DecoderState,
+        sr_cond: Option<usize>,
+    ) -> Result<Tensor> {
         let z = self.to_compute_dtype(z)?;
-        let x = self.decoder.forward_stream(&z, state)?;
+        let sr_cond = if sr_cond.is_none() && self.decoder.sr_bin_boundaries.is_some() {
+            Some(self.out_sample_rate)
+        } else {
+            sr_cond
+        };
+        let x = self.decoder.forward_stream(&z, state, sr_cond)?;
         self.to_output_dtype(x)
     }
 
@@ -738,6 +875,11 @@ impl AudioVAE {
         _dtype: DType,
     ) -> Result<DecoderState> {
         self.decoder.init_state(batch_size, device, self.dtype)
+    }
+
+    #[must_use]
+    pub fn compute_dtype(&self) -> DType {
+        self.dtype
     }
 
     pub fn encode(&self, audio_data: &Tensor, sample_rate: Option<usize>) -> Result<Tensor> {

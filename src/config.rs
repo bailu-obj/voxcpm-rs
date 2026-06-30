@@ -20,12 +20,16 @@ pub struct VoxMiniCPM4Config {
     pub num_key_value_heads: usize,
     pub rms_norm_eps: f64,
     pub rope_theta: f32,
+    #[serde(default)]
+    pub kv_channels: Option<usize>,
     pub rope_scaling: VoxRopeScalingConfig,
     pub vocab_size: usize,
     pub scale_emb: f32,
     pub dim_model_base: usize,
     pub scale_depth: f32,
     pub use_mup: bool,
+    #[serde(default)]
+    pub no_rope: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -34,6 +38,8 @@ pub struct VoxCPMEncoderConfig {
     pub ffn_dim: usize,
     pub num_heads: usize,
     pub num_layers: usize,
+    #[serde(default)]
+    pub kv_channels: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -50,6 +56,10 @@ pub struct VoxCPMDitConfig {
     pub ffn_dim: usize,
     pub num_heads: usize,
     pub num_layers: usize,
+    #[serde(default)]
+    pub kv_channels: Option<usize>,
+    #[serde(default)]
+    pub mean_mode: Option<bool>,
     pub cfm_config: CfmConfig,
 }
 
@@ -60,20 +70,38 @@ pub struct AudioVaeConfig {
     pub latent_dim: usize,
     pub decoder_dim: usize,
     pub decoder_rates: Vec<usize>,
+    #[serde(default)]
+    pub sr_bin_boundaries: Option<Vec<usize>>,
     pub sample_rate: usize,
+    #[serde(default)]
+    pub out_sample_rate: Option<usize>,
+}
+
+fn default_architecture() -> String {
+    "voxcpm".to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct VoxCPMConfig {
+    #[serde(default = "default_architecture")]
+    pub architecture: String,
     pub lm_config: VoxMiniCPM4Config,
     pub patch_size: usize,
     pub feat_dim: usize,
     pub scalar_quantization_latent_dim: usize,
     pub scalar_quantization_scale: usize,
     pub residual_lm_num_layers: usize,
+    #[serde(default)]
+    pub residual_lm_no_rope: Option<bool>,
     pub encoder_config: VoxCPMEncoderConfig,
     pub dit_config: VoxCPMDitConfig,
     pub audio_vae_config: Option<AudioVaeConfig>,
     pub max_length: usize,
     pub dtype: String,
+}
+
+impl VoxCPMConfig {
+    pub fn is_voxcpm2(&self) -> bool {
+        self.architecture.eq_ignore_ascii_case("voxcpm2")
+    }
 }

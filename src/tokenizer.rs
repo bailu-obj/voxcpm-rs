@@ -1,9 +1,10 @@
 use anyhow::{anyhow, Ok, Result};
+use std::collections::HashMap;
 use tokenizers::Tokenizer;
 
 pub struct SingleChineseTokenizer {
     tokenizer: Tokenizer,
-    multichar_tokens: Vec<String>,
+    split_map: HashMap<u32, Vec<u32>>,
 }
 
 impl SingleChineseTokenizer {
@@ -20,22 +21,25 @@ impl SingleChineseTokenizer {
         );
         let tokenizer = Tokenizer::from_file(tokenizer_file)
             .map_err(|e| anyhow!(format!("tokenizer from file error{e}")))?;
-        let mut multichar_tokens = Vec::new();
-        for (token, _) in tokenizer.get_vocab(false) {
-            let len = token.chars().count();
-            if len >= 2 {
-                let is_chinese = token.chars().all(|c| {
-                    let c_ = c as u32;
-                    (0x4E00..=0x9FFF).contains(&c_)
-                });
-                if is_chinese {
-                    multichar_tokens.push(token);
+        let mut split_map = HashMap::new();
+        for (token, token_id) in tokenizer.get_vocab(false) {
+            let clean_token = token.replace("▁", "");
+            let mut chars = clean_token.chars();
+            let is_multichar_cjk =
+                chars.clone().count() >= 2 && chars.all(Self::is_cjk);
+            if is_multichar_cjk {
+                let char_ids = clean_token
+                    .chars()
+                    .map(|c| tokenizer.token_to_id(&c.to_string()))
+                    .collect::<Option<Vec<_>>>();
+                if let Some(char_ids) = char_ids {
+                    split_map.insert(token_id, char_ids);
                 }
             }
         }
         Ok(Self {
             tokenizer,
-            multichar_tokens,
+            split_map,
         })
     }
 
@@ -44,21 +48,24 @@ impl SingleChineseTokenizer {
             .tokenizer
             .encode(text, false)
             .map_err(|e| anyhow!(format!("tokenizer encode error:  {e}")))?;
-        let tokens = encode.get_tokens();
-        let mut split_character = Vec::new();
-        for token in tokens {
-            let clean_token = token.replace("▁", "");
-            if self.multichar_tokens.contains(&clean_token) {
-                let chars: Vec<String> = clean_token.chars().map(|c| c.to_string()).collect();
-                split_character.extend(chars);
+        let mut ids = Vec::new();
+        for id in encode.get_ids() {
+            if let Some(expanded) = self.split_map.get(id) {
+                ids.extend_from_slice(expanded);
             } else {
-                split_character.push(token.clone());
+                ids.push(*id);
             }
         }
-        let ids: Vec<u32> = split_character
-            .iter()
-            .filter_map(|c| self.tokenizer.token_to_id(c))
-            .collect();
         Ok(ids)
+    }
+
+    fn is_cjk(c: char) -> bool {
+        matches!(
+            c as u32,
+            0x4E00..=0x9FFF
+                | 0x3400..=0x4DBF
+                | 0xF900..=0xFAFF
+                | 0x20000..=0x2A6DF
+        )
     }
 }

@@ -8,10 +8,10 @@ description = "Standalone VoxCPM Text-to-Speech model implementation in Rust"
 keywords = ["tts", "text-to-speech", "audio", "ai", "voxcpm"]
 
 [dependencies]
-candle-core = "0.10.1"
-candle-nn = "0.10.1"
-candle-transformers = "0.10.1"
-candle-flash-attn = { version = "0.10.1", optional = true }
+candle-core = "0.10.2"
+candle-nn = "0.10.2"
+candle-transformers = "0.10.2"
+candle-flash-attn = { version = "0.10.2", optional = true }
 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -36,6 +36,10 @@ flash-attn = ["candle-flash-attn"]
 [[example]]
 name = "vox_cpm_tts_cli"
 path = "examples/vox_cpm_tts_cli.rs"
+
+[[example]]
+name = "voxcpm2_benchmark"
+path = "examples/voxcpm2_benchmark.rs"
 
 
 [profile.release]

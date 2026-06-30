@@ -2,6 +2,7 @@ use anyhow::Result;
 use candle_core::{Tensor, D};
 use candle_nn::{linear, linear_no_bias, Activation, Linear, Module, VarBuilder};
 
+use crate::kv_cache::KvCache;
 use crate::position_embed::rope::apply_rotary_pos_emb;
 use crate::utils::tensor::repeat_kv;
 
@@ -78,7 +79,7 @@ impl Module for GateUpDownMLP {
 /// of dispatching three small matmuls on the same input. For a typical VoxCPM
 /// utterance this removes ~4.7k Metal kernel launches and lets the GPU reuse the
 /// activation in L2 rather than reloading it three times.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct NaiveAttention {
     qkv_proj: Linear,
     o_proj: Linear,
@@ -90,7 +91,7 @@ pub struct NaiveAttention {
     q_out: usize,
     kv_out: usize,
     scale: f64,
-    kv_cache: Option<(Tensor, Tensor)>,
+    kv_cache: KvCache,
 }
 
 impl NaiveAttention {
@@ -164,7 +165,7 @@ impl NaiveAttention {
             q_out,
             kv_out,
             scale,
-            kv_cache: None,
+            kv_cache: KvCache::default(),
         })
     }
 
@@ -221,8 +222,8 @@ impl NaiveAttention {
     pub fn forward_with_cache(
         &mut self,
         xs: &Tensor,
-        cos: &Tensor,
-        sin: &Tensor,
+        cos: Option<&Tensor>,
+        sin: Option<&Tensor>,
         attention_mask: Option<&Tensor>,
         tof32: bool,
     ) -> Result<Tensor> {
@@ -239,21 +240,19 @@ impl NaiveAttention {
             .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
 
-        let (query_states, key_states) =
-            apply_rotary_pos_emb(&query_states, &key_states, cos, sin, tof32)?;
+        let (query_states, key_states) = if let (Some(cos), Some(sin)) = (cos, sin) {
+            apply_rotary_pos_emb(&query_states, &key_states, cos, sin, tof32)?
+        } else {
+            (query_states, key_states)
+        };
 
-        if self.kv_cache.is_none() {
-            self.kv_cache = Some((key_states, value_states));
-        } else if let Some((k, v)) = &mut self.kv_cache {
-            *k = Tensor::cat(&[&*k, &key_states], 2)?;
-            *v = Tensor::cat(&[&*v, &value_states], 2)?;
-        }
-        let (key_states, value_states) = self.kv_cache.as_ref().unwrap();
+        self.kv_cache.append(key_states, value_states)?;
+        let (key_states, value_states) = self.kv_cache.keys_values()?;
 
         let attn_output = eager_attention_forward(
             &query_states,
-            key_states,
-            value_states,
+            &key_states,
+            &value_states,
             Some(self.num_kv_groups),
             attention_mask,
             self.scale,
@@ -264,7 +263,7 @@ impl NaiveAttention {
     }
 
     pub fn clear_kv_cache(&mut self) {
-        self.kv_cache = None
+        self.kv_cache.clear();
     }
 }
 

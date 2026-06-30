@@ -217,6 +217,45 @@ pub fn nonzero_slice(mask: &Tensor) -> Result<Vec<(usize, usize)>> {
     }
 }
 
+/// Map `input` to a bucket index using sorted `boundaries` (PyTorch `bucketize` semantics).
+pub fn bucketize(input: usize, boundaries: &[usize]) -> Result<usize> {
+    if boundaries.is_empty() {
+        return Err(anyhow!("bucketize param boundaries can not be empty"));
+    }
+    match boundaries.binary_search(&input) {
+        Ok(i) | Err(i) => Ok(i),
+    }
+}
+
+/// Scatter `replace` rows into `original` at explicit `(start, end)` token spans (batch dim 0).
+///
+/// Avoids CPU mask scans when audio/text layout is known from input preparation.
+pub fn scatter_ranges_dim0(
+    original: &Tensor,
+    replace: &Tensor,
+    ranges: &[(usize, usize)],
+) -> Result<Tensor> {
+    if original.dim(0)? != 1 {
+        return Err(anyhow!(format!(
+            "scatter_ranges_dim0 requires batch size 1, got {}",
+            original.dim(0)?
+        )));
+    }
+    let mut original = original.squeeze(0)?;
+    let mut sub_start = 0usize;
+    for &(start, end) in ranges {
+        let span = end.saturating_sub(start);
+        if span == 0 {
+            continue;
+        }
+        let sub_end = sub_start + span;
+        let sub_replace = replace.i((sub_start..sub_end, ..))?;
+        original = original.slice_assign(&[(start..end), (0..original.dim(1)?)], &sub_replace)?;
+        sub_start = sub_end;
+    }
+    Ok(original.unsqueeze(0)?)
+}
+
 pub fn masked_scatter_dim0(original: &Tensor, replace: &Tensor, mask: &Tensor) -> Result<Tensor> {
     // 根据mask中非0元素所在索引,使用replace中的数据替换掉original中的数据
     // original: rank = 3: (bs, seq_len, hidden_dim)
@@ -879,4 +918,23 @@ pub fn pad_reflect_last_dim(t: &Tensor, pad: (usize, usize)) -> Result<Tensor> {
         pad_tensor = Tensor::cat(&[&pad_tensor, &right_flip], D::Minus1)?;
     }
     Ok(pad_tensor)
+}
+
+#[cfg(test)]
+mod scatter_tests {
+    use super::*;
+    use candle_core::{Device, DType};
+
+    #[test]
+    fn scatter_ranges_dim0_replaces_span() -> Result<()> {
+        let device = Device::Cpu;
+        let original = Tensor::zeros((1, 4, 2), DType::F32, &device)?;
+        let replace = Tensor::from_slice(&[1.0f32, 2.0, 3.0, 4.0], (2, 2), &device)?;
+        let out = scatter_ranges_dim0(&original, &replace, &[(1, 3)])?;
+        let row1 = out.i((0, 1, ..))?.to_vec1::<f32>()?;
+        assert_eq!(row1, vec![1.0, 2.0]);
+        let row2 = out.i((0, 2, ..))?.to_vec1::<f32>()?;
+        assert_eq!(row2, vec![3.0, 4.0]);
+        Ok(())
+    }
 }
