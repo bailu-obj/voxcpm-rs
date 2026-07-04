@@ -6,6 +6,7 @@ use crate::{
     common::{GateUpDownMLP, NaiveAttention},
     config::VoxMiniCPM4Config,
     position_embed::rope::compute_default_rope_parameters,
+    quant::QuantBuildCtx,
     utils::tensor::prepare_causal_attention_mask,
 };
 
@@ -111,10 +112,11 @@ pub struct MiniCPMDecoderLayer {
 }
 
 impl MiniCPMDecoderLayer {
-    pub fn new(vb: VarBuilder, cfg: &VoxMiniCPM4Config) -> Result<Self> {
+    pub fn new(vb: VarBuilder, cfg: &VoxMiniCPM4Config, qctx: &QuantBuildCtx) -> Result<Self> {
         let head_dim = cfg
             .kv_channels
             .unwrap_or(cfg.hidden_size / cfg.num_attention_heads);
+        let layer_ctx = qctx.pp("self_attn");
         let self_attn = NaiveAttention::new(
             vb.pp("self_attn"),
             cfg.hidden_size,
@@ -123,6 +125,7 @@ impl MiniCPMDecoderLayer {
             Some(head_dim),
             false,
             None,
+            &layer_ctx,
         )?;
         let mlp = GateUpDownMLP::new(
             vb.pp("mlp"),
@@ -130,6 +133,7 @@ impl MiniCPMDecoderLayer {
             cfg.intermediate_size,
             candle_nn::Activation::Silu,
             false,
+            &qctx.pp("mlp"),
         )?;
         let input_layernorm =
             rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
@@ -221,7 +225,7 @@ pub struct MiniCPMModel {
 }
 
 impl MiniCPMModel {
-    pub fn new(vb: VarBuilder, cfg: VoxMiniCPM4Config) -> Result<Self> {
+    pub fn new(vb: VarBuilder, cfg: VoxMiniCPM4Config, qctx: QuantBuildCtx) -> Result<Self> {
         // let vb = vb.pp("model");
         let embed_tokens = if cfg.vocab_size > 0 {
             Some(embedding(
@@ -236,7 +240,7 @@ impl MiniCPMModel {
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_layers = vb.pp("layers");
         for i in 0..cfg.num_hidden_layers {
-            let layer = MiniCPMDecoderLayer::new(vb_layers.pp(i), &cfg)?;
+            let layer = MiniCPMDecoderLayer::new(vb_layers.pp(i), &cfg, &qctx.pp(&format!("layers.{i}")))?;
             layers.push(layer);
         }
         let norm = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("norm"))?;

@@ -1,5 +1,5 @@
 use anyhow::{Ok, Result};
-use candle_core::{pickle::read_all_with_key, DType, Device, Tensor};
+use candle_core::{pickle::read_all_with_key, DType, Device, DeviceLocation, Tensor};
 use candle_nn::VarBuilder;
 use std::collections::HashMap;
 
@@ -7,13 +7,33 @@ use crate::{
     audio_vae::AudioVAE,
     config::{AudioVaeConfig, VoxCPMConfig},
     models::VoxCPMModel,
+    quant::VoxCPMQuantConfig,
     tokenizer::SingleChineseTokenizer,
-    utils::device::{get_compute_dtype, get_device, get_vae_compute_dtype},
+    utils::device::{get_compute_dtype, get_device, get_quant_compute_dtype, get_vae_compute_dtype},
 };
 
 const DEFAULT_INFERENCE_TIMESTEPS: usize = 8;
 pub const DEFAULT_STREAM_DECODE_LATENT_BATCH: usize = 8;
 const DEFAULT_STOP_CHECK_INTERVAL: usize = 4;
+
+/// Runtime options for model load (device, dtype, quantization).
+#[derive(Debug, Clone, Default)]
+pub struct VoxCPMGeneratorOptions {
+    pub device: Option<Device>,
+    pub device_id: Option<usize>,
+    pub dtype: Option<DType>,
+    pub vae_dtype: Option<DType>,
+    pub quant: VoxCPMQuantConfig,
+    /// Fixed RNG seed for reproducible generation (compare / tests).
+    pub seed: Option<u64>,
+}
+
+impl VoxCPMGeneratorOptions {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct VoxCPMGenerationConfig {
@@ -120,25 +140,31 @@ pub struct VoxCPMGenerator {
     prompt_cache: Option<HashMap<String, Tensor>>,
     sample_rate: usize,
     model_name: String,
+    generation_seed: Option<u64>,
 }
 
 impl VoxCPMGenerator {
-    /// Initialize VoxCPM model from path
-    ///
-    /// # Arguments
-    /// * `path` - Path to model directory
-    /// * `device` - Optional device (None for auto-detect)
-    /// * `dtype` - Optional data type (None prefers F16 on GPU when the config is F32)
+    /// Initialize VoxCPM model from path (backward-compatible defaults).
     pub fn new(path: &str, device: Option<&Device>, dtype: Option<DType>) -> Result<Self> {
-        let device = &get_device(device);
+        let mut options = VoxCPMGeneratorOptions::default();
+        options.device = device.cloned();
+        options.dtype = dtype;
+        Self::new_with_options(path, &options)
+    }
+
+    /// Initialize VoxCPM model with full runtime options.
+    pub fn new_with_options(path: &str, options: &VoxCPMGeneratorOptions) -> Result<Self> {
+        let device = get_device(options.device.as_ref(), options.device_id);
+        let dtype = options.dtype;
+        let vae_dtype_override = options.vae_dtype;
         let config_path = path.to_string() + "/config.json";
         let config: VoxCPMConfig = serde_json::from_slice(&std::fs::read(config_path)?)?;
 
         // Load VAE weights: prefer mmap safetensors (e.g. `*vae*.safetensors`), else PyTorch `.pth`.
         let vae_safetensors = find_vae_safetensors(path)?;
         let (vb_vae, _vae_dtype) = if !vae_safetensors.is_empty() {
-            let vae_dtype = get_vae_compute_dtype(dtype, DType::F32, device);
-            let vb = unsafe { VarBuilder::from_mmaped_safetensors(&vae_safetensors, vae_dtype, device)? };
+            let vae_dtype = get_vae_compute_dtype(vae_dtype_override, DType::F32, &device);
+            let vb = unsafe { VarBuilder::from_mmaped_safetensors(&vae_safetensors, vae_dtype, &device)? };
             (vb, vae_dtype)
         } else {
             let model_list = find_type_files(path, "pth")?;
@@ -153,9 +179,9 @@ impl VoxCPMGenerator {
                 }
             }
 
-            let vae_dtype = get_vae_compute_dtype(dtype, vae_dtype, device);
+            let vae_dtype = get_vae_compute_dtype(vae_dtype_override, vae_dtype, &device);
             (
-                VarBuilder::from_tensors(dict_to_hashmap, vae_dtype, device),
+                VarBuilder::from_tensors(dict_to_hashmap, vae_dtype, &device),
                 vae_dtype,
             )
         };
@@ -205,7 +231,11 @@ impl VoxCPMGenerator {
         )?;
 
         let cfg_dtype = config.dtype.as_str();
-        let m_dtype = get_compute_dtype(dtype, cfg_dtype, device);
+        let m_dtype = if options.quant.is_enabled() {
+            get_quant_compute_dtype(dtype, cfg_dtype, &device)
+        } else {
+            get_compute_dtype(dtype, cfg_dtype, &device)
+        };
 
         // Load main model weights (. bin or .safetensors)
         let model_list = find_type_files(path, "bin")?;
@@ -215,7 +245,7 @@ impl VoxCPMGenerator {
                 .into_iter()
                 .filter(|p| !p.to_lowercase().contains("vae"))
                 .collect();
-            unsafe { VarBuilder::from_mmaped_safetensors(&main_st, m_dtype, device)? }
+            unsafe { VarBuilder::from_mmaped_safetensors(&main_st, m_dtype, &device)? }
         } else {
             let mut dict_to_hashmap = HashMap::new();
             for m in model_list {
@@ -224,18 +254,39 @@ impl VoxCPMGenerator {
                     dict_to_hashmap.insert(k, v);
                 }
             }
-            VarBuilder::from_tensors(dict_to_hashmap, m_dtype, device)
+            VarBuilder::from_tensors(dict_to_hashmap, m_dtype, &device)
         };
 
         let tokenizer = SingleChineseTokenizer::new(path)?;
-        let voxcpm = VoxCPMModel::new(vb_voxcpm, config, tokenizer, audio_vae)?;
+        let voxcpm = VoxCPMModel::new(
+            vb_voxcpm,
+            config,
+            tokenizer,
+            audio_vae,
+            options.quant.clone(),
+        )?;
 
         Ok(Self {
             voxcpm,
             prompt_cache: None,
             sample_rate: out_sample_rate,
             model_name,
+            generation_seed: options
+                .seed
+                .or_else(|| parse_seed_from_env()),
         })
+    }
+
+    fn apply_generation_seed(&self) -> Result<()> {
+        if let Some(seed) = self.generation_seed {
+            match self.voxcpm.device().location() {
+                DeviceLocation::Metal { .. } | DeviceLocation::Cuda { .. } => {
+                    self.voxcpm.device().set_seed(seed)?;
+                }
+                DeviceLocation::Cpu => {}
+            }
+        }
+        Ok(())
     }
 
     /// Build prompt cache for batch processing
@@ -257,6 +308,7 @@ impl VoxCPMGenerator {
         target_text: String,
         config: VoxCPMGenerationConfig,
     ) -> Result<Tensor> {
+        self.apply_generation_seed()?;
         match self.prompt_cache.as_ref() {
             Some(cache) => self
                 .voxcpm
@@ -285,6 +337,7 @@ impl VoxCPMGenerator {
         target_text: String,
         config: VoxCPMGenerationConfig,
     ) -> Result<Box<dyn Iterator<Item = Result<Tensor>> + '_>> {
+        self.apply_generation_seed()?;
         match self.prompt_cache.as_ref() {
             Some(cache) => Ok(Box::new(self.voxcpm.generate_stream_with_prompt_cache(
                 target_text,
@@ -366,6 +419,12 @@ impl VoxCPMGenerator {
     pub fn to_pcm(&self, audio: &Tensor) -> Result<Vec<i16>> {
         crate::utils::audio::to_pcm(audio)
     }
+
+    /// Load-time quantization statistics (layer coverage, bytes, fallbacks).
+    #[must_use]
+    pub fn quant_stats(&self) -> crate::quant::QuantStats {
+        self.voxcpm.quant_stats()
+    }
 }
 
 /// Find files with specific extension in directory
@@ -390,3 +449,12 @@ fn find_vae_safetensors(path: &str) -> Result<Vec<String>> {
         .filter(|p| p.to_lowercase().contains("vae"))
         .collect())
 }
+
+fn parse_seed_from_env() -> Option<u64> {
+    std::env::var("VOXCPM_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+}
+
+/// Default seed for FP-vs-quant comparison runs.
+pub const COMPARE_FP_DEFAULT_SEED: u64 = 42;

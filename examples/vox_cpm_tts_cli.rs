@@ -5,7 +5,11 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::time::Instant;
-use voxcpm_rs::{VoxCPMGenerationConfig, VoxCPMGenerator};
+use voxcpm_rs::{
+    audio_quality_ok,     compare_fp_enabled, compare_fp_min_correlation, pcm_correlation, utils::device::parse_dtype_option,
+    COMPARE_FP_DEFAULT_SEED, VoxCPMGenerationConfig, VoxCPMGenerator,
+    VoxCPMGeneratorOptions, VoxCPMQuantConfig, VoxCPMWeightQuant,
+};
 
 #[derive(Parser, Debug)]
 #[command(name = "voxcpm-cli", about = "VoxCPM TTS / Voice Cloning CLI")]
@@ -37,6 +41,26 @@ struct Args {
     /// Enable streaming TTS (no-ref only)
     #[arg(long, default_value = "false")]
     stream: bool,
+
+    /// Weight quantization: none|q8_0|q4_k|q5_k|q6_k
+    #[arg(long, default_value = "none")]
+    quant: String,
+
+    /// Compute dtype: auto|f32|f16|bf16
+    #[arg(long, default_value = "auto")]
+    dtype: String,
+
+    /// VAE dtype: auto|f32|f16|bf16
+    #[arg(long, default_value = "auto")]
+    vae_dtype: String,
+
+    /// GPU device ordinal (CUDA/Metal)
+    #[arg(long)]
+    device_id: Option<usize>,
+
+    /// Compare output against FP baseline when quant is enabled.
+    #[arg(long, default_value = "false")]
+    compare_fp: bool,
 }
 
 fn main() -> Result<()> {
@@ -44,13 +68,34 @@ fn main() -> Result<()> {
 
     let texts = load_texts(&args)?;
 
+    let quant_weight: VoxCPMWeightQuant = args.quant.parse().map_err(anyhow::Error::msg)?;
+    let compare_fp = args.compare_fp || compare_fp_enabled();
+
+    let compare_seed = if compare_fp && quant_weight.is_enabled() {
+        Some(COMPARE_FP_DEFAULT_SEED)
+    } else {
+        None
+    };
+
+    let fp_pcm = if compare_fp && quant_weight.is_enabled() {
+        println!("Generating FP baseline for compare...");
+        Some(generate_fp_pcm(&args, &texts, args.stream, compare_seed)?)
+    } else {
+        None
+    };
+
+    let mut options = VoxCPMGeneratorOptions::default();
+    options.device_id = args.device_id;
+    options.dtype = parse_dtype_option(Some(&args.dtype));
+    options.vae_dtype = parse_dtype_option(Some(&args.vae_dtype));
+    options.quant = VoxCPMQuantConfig::with_weight(quant_weight);
+    options.seed = compare_seed;
+
     println!("Loading model...");
-    let mut generator = VoxCPMGenerator::new(args.model.to_str().unwrap(), None, None)?;
+    let mut generator =
+        VoxCPMGenerator::new_with_options(args.model.to_str().unwrap(), &options)?;
     println!("✓ Model loaded");
 
-    // --------------------------------------------------
-    // 🔹 Prompt cache initialization (ONCE)
-    // --------------------------------------------------
     let use_ref = match (&args.ref_wav, &args.ref_text) {
         (Some(wav), Some(text)) => {
             println!("Initializing prompt cache...");
@@ -154,6 +199,23 @@ fn main() -> Result<()> {
             let tensor = generator.generate_with_config(text.clone(), generation_config)?;
 
             let tensor_cpu = tensor.to_device(&Device::Cpu)?;
+            let pcm = generator.to_pcm(&tensor_cpu)?;
+            if !audio_quality_ok(&pcm) {
+                bail!("audio quality check failed for text: {text}");
+            }
+            if let Some(ref baseline) = fp_pcm {
+                if i == 0 {
+                    let corr = pcm_correlation(baseline, &pcm);
+                    let threshold = compare_fp_min_correlation(quant_weight);
+                    eprintln!("VOXCPM_COMPARE_FP correlation={corr:.4} threshold={threshold:.2}");
+                    if corr < threshold {
+                        bail!(
+                            "FP compare failed: correlation {corr:.4} < {threshold:.2} for quant {}",
+                            args.quant
+                        );
+                    }
+                }
+            }
             let wav = generator.to_wav(&tensor_cpu)?;
             let text_prefix = text_preview(text, 12);
 
@@ -239,5 +301,51 @@ fn text_preview(s: &str, max_chars: usize) -> String {
         format!("{t}…")
     } else {
         t
+    }
+}
+
+fn build_options(args: &Args, quant: VoxCPMWeightQuant, seed: Option<u64>) -> VoxCPMGeneratorOptions {
+    let mut options = VoxCPMGeneratorOptions::default();
+    options.device_id = args.device_id;
+    options.dtype = parse_dtype_option(Some(&args.dtype));
+    options.vae_dtype = parse_dtype_option(Some(&args.vae_dtype));
+    options.quant = VoxCPMQuantConfig::with_weight(quant);
+    options.seed = seed;
+    options
+}
+
+fn init_generator(args: &Args, quant: VoxCPMWeightQuant, seed: Option<u64>) -> Result<VoxCPMGenerator> {
+    let mut generator =
+        VoxCPMGenerator::new_with_options(args.model.to_str().unwrap(), &build_options(args, quant, seed))?;
+    if let (Some(wav), Some(text)) = (&args.ref_wav, &args.ref_text) {
+        generator.build_prompt_cache(text.clone(), wav.to_string_lossy().to_string())?;
+    }
+    Ok(generator)
+}
+
+fn generation_config(args: &Args) -> VoxCPMGenerationConfig {
+    if args.ref_wav.is_some() && args.ref_text.is_some() {
+        VoxCPMGenerationConfig::voice_clone()
+    } else {
+        VoxCPMGenerationConfig::simple()
+    }
+}
+
+fn generate_fp_pcm(args: &Args, texts: &[String], stream: bool, seed: Option<u64>) -> Result<Vec<i16>> {
+    let mut generator = init_generator(args, VoxCPMWeightQuant::None, seed)?;
+    let config = generation_config(args);
+    let text = texts
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("no input text"))?
+        .clone();
+    if stream {
+        let mut pcm = Vec::new();
+        for chunk in generator.generate_pcm_stream_with_config(text, config)? {
+            pcm.extend(chunk?);
+        }
+        Ok(pcm)
+    } else {
+        let tensor = generator.generate_with_config(text, config)?;
+        generator.to_pcm(&tensor)
     }
 }

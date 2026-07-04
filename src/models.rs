@@ -1,6 +1,6 @@
 use anyhow::Result;
 use candle_core::{DType, Device, IndexOp, Tensor, D};
-use candle_nn::{linear, linear_no_bias, Linear, Module, VarBuilder};
+use candle_nn::{Module, VarBuilder};
 use std::{
     cmp::max,
     collections::HashMap,
@@ -11,8 +11,12 @@ use crate::{
     audio_vae::AudioVAE,
     config::{CfmConfig, VoxCPMConfig, VoxMiniCPM4Config},
     generate::VoxCPMGenerationConfig,
+    linear::{linear_x, LinearX},
     minicpm4::MiniCPMModel,
-    profile::{profile_enabled, profile_stream_enabled, InferenceStepProfile},
+    profile::{
+        profile_stream_enabled, stage_capture_enabled, InferenceStepProfile, StageProfile,
+    },
+    quant::{QuantBuildCtx, QuantStats, VoxCPMQuantConfig},
     tokenizer::SingleChineseTokenizer,
     utils::audio::load_audio_with_resample,
     utils::tensor::{linspace, scatter_ranges_dim0},
@@ -50,8 +54,8 @@ impl GenerationParams {
 
 pub struct ScalarQuantizationLayer {
     scale: usize,
-    in_proj: Linear,
-    out_proj: Linear,
+    in_proj: LinearX,
+    out_proj: LinearX,
 }
 
 impl ScalarQuantizationLayer {
@@ -61,9 +65,10 @@ impl ScalarQuantizationLayer {
         out_dim: usize,
         laten_dim: usize,
         scale: usize,
+        qctx: &QuantBuildCtx,
     ) -> Result<Self> {
-        let in_proj = linear(in_dim, laten_dim, vb.pp("in_proj"))?;
-        let out_proj = linear(laten_dim, out_dim, vb.pp("out_proj"))?;
+        let in_proj = linear_x(in_dim, laten_dim, vb.pp("in_proj"), &qctx.pp("in_proj"), true)?;
+        let out_proj = linear_x(laten_dim, out_dim, vb.pp("out_proj"), &qctx.pp("out_proj"), true)?;
         Ok(Self {
             scale,
             in_proj,
@@ -130,8 +135,8 @@ impl SinusoidalPosEmb {
 }
 
 pub struct TimestepEmbedding {
-    linear_1: Linear,
-    linear_2: Linear,
+    linear_1: LinearX,
+    linear_2: LinearX,
 }
 
 impl TimestepEmbedding {
@@ -140,14 +145,23 @@ impl TimestepEmbedding {
         in_channels: usize,
         time_embed_dim: usize,
         out_dim: Option<usize>,
+        qctx: &QuantBuildCtx,
     ) -> Result<Self> {
-        let linear_1 = linear(in_channels, time_embed_dim, vb.pp("linear_1"))?;
-        let time_embed_dim_out = if let Some(out_dim) = out_dim {
-            out_dim
-        } else {
-            time_embed_dim
-        };
-        let linear_2 = linear(time_embed_dim, time_embed_dim_out, vb.pp("linear_2"))?;
+        let linear_1 = linear_x(
+            in_channels,
+            time_embed_dim,
+            vb.pp("linear_1"),
+            &qctx.pp("linear_1"),
+            true,
+        )?;
+        let time_embed_dim_out = out_dim.unwrap_or(time_embed_dim);
+        let linear_2 = linear_x(
+            time_embed_dim,
+            time_embed_dim_out,
+            vb.pp("linear_2"),
+            &qctx.pp("linear_2"),
+            true,
+        )?;
         Ok(Self { linear_1, linear_2 })
     }
 
@@ -159,9 +173,9 @@ impl TimestepEmbedding {
 }
 
 pub struct VoxCPMLocDiT {
-    in_proj: Linear,
-    cond_proj: Linear,
-    out_proj: Linear,
+    in_proj: LinearX,
+    cond_proj: LinearX,
+    out_proj: LinearX,
     time_embeddings: SinusoidalPosEmb,
     time_mlp: TimestepEmbedding,
     delta_time_mlp: TimestepEmbedding,
@@ -178,25 +192,50 @@ pub struct VoxCPMLocDiT {
 }
 
 impl VoxCPMLocDiT {
-    pub fn new(vb: VarBuilder, config: VoxMiniCPM4Config, in_channels: usize) -> Result<Self> {
-        let in_proj = linear(in_channels, config.hidden_size, vb.pp("in_proj"))?;
-        let cond_proj = linear(in_channels, config.hidden_size, vb.pp("cond_proj"))?;
-        let out_proj = linear(config.hidden_size, in_channels, vb.pp("out_proj"))?;
+    pub fn new(
+        vb: VarBuilder,
+        config: VoxMiniCPM4Config,
+        in_channels: usize,
+        qctx: QuantBuildCtx,
+    ) -> Result<Self> {
+        let in_proj = linear_x(
+            in_channels,
+            config.hidden_size,
+            vb.pp("in_proj"),
+            &qctx.pp("in_proj"),
+            true,
+        )?;
+        let cond_proj = linear_x(
+            in_channels,
+            config.hidden_size,
+            vb.pp("cond_proj"),
+            &qctx.pp("cond_proj"),
+            true,
+        )?;
+        let out_proj = linear_x(
+            config.hidden_size,
+            in_channels,
+            vb.pp("out_proj"),
+            &qctx.pp("out_proj"),
+            true,
+        )?;
         let time_embeddings = SinusoidalPosEmb::new(config.hidden_size)?;
         let time_mlp = TimestepEmbedding::new(
             vb.pp("time_mlp"),
             config.hidden_size,
             config.hidden_size,
             None,
+            &qctx.pp("time_mlp"),
         )?;
         let delta_time_mlp = TimestepEmbedding::new(
             vb.pp("delta_time_mlp"),
             config.hidden_size,
             config.hidden_size,
             None,
+            &qctx.pp("delta_time_mlp"),
         )?;
         assert_eq!(config.vocab_size, 0, "vocab_size must be 0 for local DiT");
-        let decoder = MiniCPMModel::new(vb.pp("decoder"), config.clone())?;
+        let decoder = MiniCPMModel::new(vb.pp("decoder"), config.clone(), qctx.pp("decoder"))?;
         Ok(Self {
             in_proj,
             cond_proj,
@@ -575,21 +614,32 @@ impl UnifiedCFM {
 
 pub struct VoxCPMLocEnc {
     special_token: Tensor,
-    in_proj: Linear,
+    in_proj: LinearX,
     encoder: MiniCPMModel,
     hidden_size: usize,
 }
 
 impl VoxCPMLocEnc {
-    pub fn new(vb: VarBuilder, config: VoxMiniCPM4Config, input_dim: usize) -> Result<Self> {
+    pub fn new(
+        vb: VarBuilder,
+        config: VoxMiniCPM4Config,
+        input_dim: usize,
+        qctx: QuantBuildCtx,
+    ) -> Result<Self> {
         let special_token = vb.get((1, 1, 1, config.hidden_size), "special_token")?;
-        let in_proj = linear(input_dim, config.hidden_size, vb.pp("in_proj"))?;
+        let in_proj = linear_x(
+            input_dim,
+            config.hidden_size,
+            vb.pp("in_proj"),
+            &qctx.pp("in_proj"),
+            true,
+        )?;
         assert_eq!(
             config.vocab_size, 0,
             "vocab_size must be 0 for local encoder"
         );
         let hidden_size = config.hidden_size;
-        let encoder = MiniCPMModel::new(vb.pp("encoder"), config)?;
+        let encoder = MiniCPMModel::new(vb.pp("encoder"), config, qctx.pp("encoder"))?;
         Ok(Self {
             special_token,
             in_proj,
@@ -629,14 +679,15 @@ pub struct VoxCPMModel {
     feat_encoder: VoxCPMLocEnc,
     feat_decoder: UnifiedCFM,
     fsq_layer: ScalarQuantizationLayer,
-    enc_to_lm_proj: Linear,
-    lm_to_dit_proj: Linear,
-    res_to_dit_proj: Linear,
-    fusion_concat_proj: Option<Linear>,
-    stop_proj: Linear,
-    stop_head: Linear,
+    enc_to_lm_proj: LinearX,
+    lm_to_dit_proj: LinearX,
+    res_to_dit_proj: LinearX,
+    fusion_concat_proj: Option<LinearX>,
+    stop_proj: LinearX,
+    stop_head: LinearX,
     device: Device,
     dtype: DType,
+    quant_stats: QuantStats,
 }
 
 impl VoxCPMModel {
@@ -645,8 +696,14 @@ impl VoxCPMModel {
         config: VoxCPMConfig,
         tokenizer: SingleChineseTokenizer,
         audio_vae: AudioVAE,
+        quant: VoxCPMQuantConfig,
     ) -> Result<Self> {
-        let base_lm = MiniCPMModel::new(vb.pp("base_lm"), config.lm_config.clone())?;
+        let qroot = QuantBuildCtx::root(quant);
+        let base_lm = MiniCPMModel::new(
+            vb.pp("base_lm"),
+            config.lm_config.clone(),
+            qroot.pp("base_lm"),
+        )?;
         let audio_start_token = 101usize;
         let ref_audio_start_token = 103u32;
         let ref_audio_end_token = 104u32;
@@ -654,7 +711,11 @@ impl VoxCPMModel {
         residual_lm_config.num_hidden_layers = config.residual_lm_num_layers;
         residual_lm_config.vocab_size = 0;
         residual_lm_config.no_rope = config.residual_lm_no_rope;
-        let residual_lm = MiniCPMModel::new(vb.pp("residual_lm"), residual_lm_config)?;
+        let residual_lm = MiniCPMModel::new(
+            vb.pp("residual_lm"),
+            residual_lm_config,
+            qroot.pp("residual_lm"),
+        )?;
         let mut encoder_config = config.lm_config.clone();
         encoder_config.hidden_size = config.encoder_config.hidden_dim;
         encoder_config.intermediate_size = config.encoder_config.ffn_dim;
@@ -662,8 +723,12 @@ impl VoxCPMModel {
         encoder_config.num_hidden_layers = config.encoder_config.num_layers;
         encoder_config.kv_channels = config.encoder_config.kv_channels;
         encoder_config.vocab_size = 0;
-        let feat_encoder =
-            VoxCPMLocEnc::new(vb.pp("feat_encoder"), encoder_config, config.feat_dim)?;
+        let feat_encoder = VoxCPMLocEnc::new(
+            vb.pp("feat_encoder"),
+            encoder_config,
+            config.feat_dim,
+            qroot.pp("feat_encoder"),
+        )?;
 
         let mut decoder_config = config.lm_config.clone();
         decoder_config.hidden_size = config.dit_config.hidden_dim;
@@ -676,6 +741,7 @@ impl VoxCPMModel {
             vb.pp("feat_decoder.estimator"),
             decoder_config,
             config.feat_dim,
+            qroot.pp("feat_decoder.estimator"),
         )?;
         let mean_mode = config.dit_config.mean_mode.unwrap_or(false);
         let feat_decoder = UnifiedCFM::new(
@@ -690,41 +756,59 @@ impl VoxCPMModel {
             config.lm_config.hidden_size,
             config.scalar_quantization_latent_dim,
             config.scalar_quantization_scale,
+            &qroot.pp("fsq_layer"),
         )?;
-        let enc_to_lm_proj = linear(
+        let enc_to_lm_proj = linear_x(
             config.encoder_config.hidden_dim,
             config.lm_config.hidden_size,
             vb.pp("enc_to_lm_proj"),
+            &qroot.pp("enc_to_lm_proj"),
+            true,
         )?;
-        let lm_to_dit_proj = linear(
+        let lm_to_dit_proj = linear_x(
             config.lm_config.hidden_size,
             config.dit_config.hidden_dim,
             vb.pp("lm_to_dit_proj"),
+            &qroot.pp("lm_to_dit_proj"),
+            true,
         )?;
-        let res_to_dit_proj = linear(
+        let res_to_dit_proj = linear_x(
             config.lm_config.hidden_size,
             config.dit_config.hidden_dim,
             vb.pp("res_to_dit_proj"),
+            &qroot.pp("res_to_dit_proj"),
+            true,
         )?;
 
         let fusion_concat_proj = if config.is_voxcpm2() {
-            Some(linear(
+            Some(linear_x(
                 config.lm_config.hidden_size * 2,
                 config.lm_config.hidden_size,
                 vb.pp("fusion_concat_proj"),
+                &qroot.pp("fusion_concat_proj"),
+                true,
             )?)
         } else {
             None
         };
 
-        let stop_proj = linear(
+        let stop_proj = linear_x(
             config.lm_config.hidden_size,
             config.lm_config.hidden_size,
             vb.pp("stop_proj"),
+            &qroot.pp("stop_proj"),
+            true,
         )?;
-        let stop_head = linear_no_bias(config.lm_config.hidden_size, 2, vb.pp("stop_head"))?;
+        let stop_head = linear_x(
+            config.lm_config.hidden_size,
+            2,
+            vb.pp("stop_head"),
+            &qroot.pp("stop_head"),
+            false,
+        )?;
 
         let patch_size = config.patch_size;
+        let quant_stats = qroot.stats();
         Ok(Self {
             config,
             patch_size,
@@ -749,7 +833,18 @@ impl VoxCPMModel {
             stop_head,
             device: vb.device().clone(),
             dtype: vb.dtype(),
+            quant_stats,
         })
+    }
+
+    #[must_use]
+    pub fn quant_stats(&self) -> QuantStats {
+        self.quant_stats.clone()
+    }
+
+    #[must_use]
+    pub fn device(&self) -> &Device {
+        &self.device
     }
 
     fn fusion_forward(&self, left: &Tensor, right: &Tensor) -> Result<Tensor> {
@@ -1049,7 +1144,11 @@ impl VoxCPMModel {
             params,
             layout,
         )?;
+        let vae_start = stage_capture_enabled().then(Instant::now);
         let decode_audio = self.audio_vae.decode(&latent_pred, None)?.squeeze(1)?;
+        if let Some(start) = vae_start {
+            StageProfile::add_vae_decode(start.elapsed());
+        }
         let audio_len = decode_audio.dim(D::Minus1)?;
         let decode_audio = decode_audio.narrow(D::Minus1, 640, audio_len - 1280)?;
         Ok(decode_audio)
@@ -1084,7 +1183,7 @@ impl VoxCPMModel {
             pending_latents: Vec::with_capacity(params.stream_decode_latent_batch),
             stream_decode_latent_batch: params.stream_decode_latent_batch,
             pending_chunk: None,
-            profile_enabled: profile_stream_enabled(),
+            profile_enabled: profile_stream_enabled() || stage_capture_enabled(),
             profile_inf_time: Duration::ZERO,
             profile_vae_time: Duration::ZERO,
             profile_prefill_time: Duration::ZERO,
@@ -1197,7 +1296,7 @@ impl VoxCPMModel {
             use_voxcpm2: false,
             feat_embed_cache: None,
             seq_tokens: t,
-            step_profile: if profile_enabled() {
+            step_profile: if stage_capture_enabled() {
                 Some(InferenceStepProfile::default())
             } else {
                 None
@@ -1215,7 +1314,7 @@ impl VoxCPMModel {
         params: GenerationParams,
         layout: VoxCPM2InputLayout,
     ) -> Result<VoxCPMInferenceStream<'_>> {
-        let prefill_start = profile_enabled().then(Instant::now);
+        let prefill_start = stage_capture_enabled().then(Instant::now);
         let (_, seq_tokens) = text.dims2()?;
         let scale_emb = if self.config.lm_config.use_mup {
             self.config.lm_config.scale_emb
@@ -1303,7 +1402,7 @@ impl VoxCPMModel {
             use_voxcpm2: true,
             feat_embed_cache,
             seq_tokens,
-            step_profile: if profile_enabled() {
+            step_profile: if stage_capture_enabled() {
                 Some(InferenceStepProfile::default())
             } else {
                 None
@@ -1504,9 +1603,14 @@ impl<'a> Drop for VoxCPMInferenceStream<'a> {
     fn drop(&mut self) {
         if let Some(profile) = &self.step_profile {
             profile.print_summary();
-        }
-        if let Some(prefill) = self.prefill_elapsed {
-            eprintln!("VOXCPM_PROFILE prefill={:.3}s", prefill.as_secs_f64());
+            if stage_capture_enabled() {
+                StageProfile::store_inference(profile, self.prefill_elapsed);
+            }
+        } else if let Some(prefill) = self.prefill_elapsed {
+            if stage_capture_enabled() {
+                eprintln!("VOXCPM_PROFILE prefill={:.3}s", prefill.as_secs_f64());
+                StageProfile::store_inference(&InferenceStepProfile::default(), Some(prefill));
+            }
         }
         self.model.base_lm.clear_kv_cache();
         self.model.residual_lm.clear_kv_cache();
@@ -1671,7 +1775,7 @@ impl<'a> Iterator for VoxCPMGenerateStream<'a> {
 
 impl<'a> Drop for VoxCPMGenerateStream<'a> {
     fn drop(&mut self) {
-        if self.profile_enabled {
+        if self.profile_enabled || stage_capture_enabled() {
             eprintln!(
                 "VOXCPM_PROFILE_STREAM chunks={} prefill={:.3}s inference_next={:.3}s vae_decode={:.3}s latents={}",
                 self.profile_chunks,
@@ -1680,6 +1784,14 @@ impl<'a> Drop for VoxCPMGenerateStream<'a> {
                 self.profile_vae_time.as_secs_f64(),
                 self.inf_stream.i,
             );
+            if stage_capture_enabled() {
+                StageProfile::store_stream(
+                    self.profile_prefill_time,
+                    self.profile_inf_time,
+                    self.profile_vae_time,
+                    self.inf_stream.i,
+                );
+            }
         }
     }
 }

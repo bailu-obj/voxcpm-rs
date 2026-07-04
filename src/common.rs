@@ -1,14 +1,17 @@
 use anyhow::Result;
 use candle_core::{Tensor, D};
-use candle_nn::{linear, linear_no_bias, Activation, Linear, Module, VarBuilder};
+use candle_nn::{Activation, Module, VarBuilder};
 
 use crate::kv_cache::KvCache;
+use crate::linear::{linear_x, LinearX};
 use crate::position_embed::rope::apply_rotary_pos_emb;
+use crate::quant::QuantBuildCtx;
 use crate::utils::tensor::repeat_kv;
 
 pub struct GateUpDownMLP {
-    gate_up_proj: Linear, // hidden → 2 * intermediate
-    down_proj: Linear,
+    gate_proj: LinearX,
+    up_proj: LinearX,
+    down_proj: LinearX,
     act_fn: Activation,
 }
 
@@ -19,43 +22,33 @@ impl GateUpDownMLP {
         intermediate_size: usize,
         act_fn: Activation,
         bias: bool,
+        qctx: &QuantBuildCtx,
     ) -> Result<Self> {
-        let gate_proj = if bias {
-            linear(hidden_size, intermediate_size, vb.pp("gate_proj"))?
-        } else {
-            linear_no_bias(hidden_size, intermediate_size, vb.pp("gate_proj"))?
-        };
-
-        let up_proj = if bias {
-            linear(hidden_size, intermediate_size, vb.pp("up_proj"))?
-        } else {
-            linear_no_bias(hidden_size, intermediate_size, vb.pp("up_proj"))?
-        };
-
-        // 2️⃣ Fuse weights
-        let gate_w = gate_proj.weight();
-        let up_w = up_proj.weight();
-        let fused_w = Tensor::cat(&[gate_w, up_w], 0)?; // [2I, H]
-
-        let fused_b = if bias {
-            Some(Tensor::cat(
-                &[gate_proj.bias().unwrap(), up_proj.bias().unwrap()],
-                0,
-            )?)
-        } else {
-            None
-        };
-
-        let gate_up_proj = Linear::new(fused_w, fused_b);
-
-        let down_proj = if bias {
-            linear(intermediate_size, hidden_size, vb.pp("down_proj"))?
-        } else {
-            linear_no_bias(intermediate_size, hidden_size, vb.pp("down_proj"))?
-        };
+        let gate_proj = linear_x(
+            hidden_size,
+            intermediate_size,
+            vb.pp("gate_proj"),
+            &qctx.pp("gate_proj"),
+            bias,
+        )?;
+        let up_proj = linear_x(
+            hidden_size,
+            intermediate_size,
+            vb.pp("up_proj"),
+            &qctx.pp("up_proj"),
+            bias,
+        )?;
+        let down_proj = linear_x(
+            intermediate_size,
+            hidden_size,
+            vb.pp("down_proj"),
+            &qctx.pp("down_proj"),
+            bias,
+        )?;
 
         Ok(Self {
-            gate_up_proj,
+            gate_proj,
+            up_proj,
             down_proj,
             act_fn,
         })
@@ -64,25 +57,20 @@ impl GateUpDownMLP {
 
 impl Module for GateUpDownMLP {
     fn forward(&self, xs: &Tensor) -> candle_core::Result<Tensor> {
-        let gate_up = xs.apply(&self.gate_up_proj)?;
-        let chunks = gate_up.chunk(2, D::Minus1)?;
-        let (gate, up) = (&chunks[0], &chunks[1]);
+        let gate = xs.apply(&self.gate_proj)?;
+        let up = xs.apply(&self.up_proj)?;
         let res = (gate.apply(&self.act_fn)? * up)?;
         res.apply(&self.down_proj)
     }
 }
 
-/// Naive multi-head attention.
-///
-/// Q/K/V projections are **fused** into a single matmul at construction time:
-/// per-call we read the activation once and split the result via `narrow`, instead
-/// of dispatching three small matmuls on the same input. For a typical VoxCPM
-/// utterance this removes ~4.7k Metal kernel launches and lets the GPU reuse the
-/// activation in L2 rather than reloading it three times.
+/// Naive multi-head attention with separate Q/K/V projections (quantized individually).
 #[derive(Debug)]
 pub struct NaiveAttention {
-    qkv_proj: Linear,
-    o_proj: Linear,
+    q_proj: LinearX,
+    k_proj: LinearX,
+    v_proj: LinearX,
+    o_proj: LinearX,
     num_heads: usize,
     num_kv_heads: usize,
     num_kv_groups: usize,
@@ -103,6 +91,7 @@ impl NaiveAttention {
         head_dim: Option<usize>,
         bias: bool,
         o_proj_pp_name: Option<&str>,
+        qctx: &QuantBuildCtx,
     ) -> Result<Self> {
         let num_kv_groups = num_attention_heads / num_key_value_heads;
         let head_dim = head_dim.unwrap_or(hidden_size / num_attention_heads);
@@ -111,51 +100,39 @@ impl NaiveAttention {
         let q_out = num_attention_heads * head_dim;
         let kv_out = num_key_value_heads * head_dim;
 
-        // Load the three separate projections, then fuse them along the output dim.
-        // Concatenation happens once at init; all forwards use the fused weight.
-        let (q_proj, k_proj, v_proj, o_proj) = if bias {
-            (
-                linear(hidden_size, q_out, vb.pp("q_proj"))?,
-                linear(hidden_size, kv_out, vb.pp("k_proj"))?,
-                linear(hidden_size, kv_out, vb.pp("v_proj"))?,
-                linear(q_out, hidden_size, vb.pp(o_proj_pp_name))?,
-            )
-        } else {
-            (
-                linear_no_bias(hidden_size, q_out, vb.pp("q_proj"))?,
-                linear_no_bias(hidden_size, kv_out, vb.pp("k_proj"))?,
-                linear_no_bias(hidden_size, kv_out, vb.pp("v_proj"))?,
-                linear_no_bias(q_out, hidden_size, vb.pp(o_proj_pp_name))?,
-            )
-        };
-
-        let fused_w =
-            Tensor::cat(&[q_proj.weight(), k_proj.weight(), v_proj.weight()], 0)?.contiguous()?;
-        let fused_b = if bias {
-            Some(
-                Tensor::cat(
-                    &[
-                        q_proj
-                            .bias()
-                            .expect("NaiveAttention bias=true but q_proj has no bias"),
-                        k_proj
-                            .bias()
-                            .expect("NaiveAttention bias=true but k_proj has no bias"),
-                        v_proj
-                            .bias()
-                            .expect("NaiveAttention bias=true but v_proj has no bias"),
-                    ],
-                    0,
-                )?
-                .contiguous()?,
-            )
-        } else {
-            None
-        };
-        let qkv_proj = Linear::new(fused_w, fused_b);
+        let q_proj = linear_x(
+            hidden_size,
+            q_out,
+            vb.pp("q_proj"),
+            &qctx.pp("q_proj"),
+            bias,
+        )?;
+        let k_proj = linear_x(
+            hidden_size,
+            kv_out,
+            vb.pp("k_proj"),
+            &qctx.pp("k_proj"),
+            bias,
+        )?;
+        let v_proj = linear_x(
+            hidden_size,
+            kv_out,
+            vb.pp("v_proj"),
+            &qctx.pp("v_proj"),
+            bias,
+        )?;
+        let o_proj = linear_x(
+            q_out,
+            hidden_size,
+            vb.pp(o_proj_pp_name),
+            &qctx.pp(o_proj_pp_name),
+            bias,
+        )?;
 
         Ok(Self {
-            qkv_proj,
+            q_proj,
+            k_proj,
+            v_proj,
             o_proj,
             num_heads: num_attention_heads,
             num_kv_heads: num_key_value_heads,
@@ -169,14 +146,13 @@ impl NaiveAttention {
         })
     }
 
-    /// Run the fused QKV projection and return `(q, k, v)` split views.
     #[inline]
     fn qkv(&self, xs: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
-        let qkv = self.qkv_proj.forward(xs)?;
-        let q = qkv.narrow(D::Minus1, 0, self.q_out)?;
-        let k = qkv.narrow(D::Minus1, self.q_out, self.kv_out)?;
-        let v = qkv.narrow(D::Minus1, self.q_out + self.kv_out, self.kv_out)?;
-        Ok((q, k, v))
+        Ok((
+            self.q_proj.forward(xs)?,
+            self.k_proj.forward(xs)?,
+            self.v_proj.forward(xs)?,
+        ))
     }
 
     pub fn forward(
@@ -267,10 +243,6 @@ impl NaiveAttention {
     }
 }
 
-/// Eager attention forward (without flash attention optimization).
-///
-/// When `num_key_value_groups` is `None` or `Some(1)`, K/V tensors are used in-place (no `repeat_kv`
-/// full-tensor clone). GMA-style MQA only uses `repeat_kv` when `g > 1`.
 pub fn eager_attention_forward(
     query_states: &Tensor,
     key_states: &Tensor,
@@ -309,7 +281,6 @@ fn eager_attention_inner(
 ) -> Result<Tensor> {
     #[cfg(not(feature = "flash-attn"))]
     {
-        // Contiguous Q improves matmul on Metal/CUDA; K/V stay strided when possible.
         let query_states = query_states.contiguous()?;
         let key_transposed = key_states.transpose(D::Minus2, D::Minus1)?;
         let mut attn_weights = query_states.matmul(&key_transposed)?.affine(scaling, 0.0)?;
