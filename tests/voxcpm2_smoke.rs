@@ -10,8 +10,8 @@ use voxcpm_rs::{VoxCPMGenerationConfig, VoxCPMGenerator};
 #[test]
 #[ignore = "requires GPU and downloaded VoxCPM2 weights"]
 fn voxcpm2_load_and_short_generate() -> anyhow::Result<()> {
-    let model_path = std::env::var("VOXCPM2_MODEL_PATH")
-        .unwrap_or_else(|_| "models/VoxCPM2".to_string());
+    let model_path =
+        std::env::var("VOXCPM2_MODEL_PATH").unwrap_or_else(|_| "models/VoxCPM2".to_string());
     let load_start = Instant::now();
     let mut generator = VoxCPMGenerator::new(&model_path, None, None)?;
     let load_secs = load_start.elapsed().as_secs_f64();
@@ -53,8 +53,8 @@ fn voxcpm2_load_and_short_generate() -> anyhow::Result<()> {
 #[test]
 #[ignore = "requires GPU and downloaded VoxCPM2 weights"]
 fn voxcpm2_stream_short_generate() -> anyhow::Result<()> {
-    let model_path = std::env::var("VOXCPM2_MODEL_PATH")
-        .unwrap_or_else(|_| "models/VoxCPM2".to_string());
+    let model_path =
+        std::env::var("VOXCPM2_MODEL_PATH").unwrap_or_else(|_| "models/VoxCPM2".to_string());
     let mut generator = VoxCPMGenerator::new(&model_path, None, None)?;
     let text = "VoxCPM2 streaming smoke.".to_string();
     let start = Instant::now();

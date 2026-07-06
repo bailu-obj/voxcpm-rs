@@ -923,7 +923,7 @@ pub fn pad_reflect_last_dim(t: &Tensor, pad: (usize, usize)) -> Result<Tensor> {
 #[cfg(test)]
 mod scatter_tests {
     use super::*;
-    use candle_core::{Device, DType};
+    use candle_core::{DType, Device};
 
     #[test]
     fn scatter_ranges_dim0_replaces_span() -> Result<()> {

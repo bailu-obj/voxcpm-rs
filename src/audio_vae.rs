@@ -1,6 +1,9 @@
-use anyhow::{Ok, Result, anyhow};
+use anyhow::{anyhow, Ok, Result};
 use candle_core::{DType, Device, Tensor, D};
-use candle_nn::{Conv1d, Conv1dConfig, ConvTranspose1d, ConvTranspose1dConfig, Embedding, Module, VarBuilder, embedding};
+use candle_nn::{
+    embedding, Conv1d, Conv1dConfig, ConvTranspose1d, ConvTranspose1dConfig, Embedding, Module,
+    VarBuilder,
+};
 
 use crate::utils::bucketize;
 
@@ -622,28 +625,27 @@ impl CausalDecoder {
         let model_minus_2 = Snake1d::new(vb_model.pp(idx), output_dim)?;
         let model_minus_1 =
             WNCausalConv1d::new(vb_model.pp(idx + 1), output_dim, d_out, 7, 1, 3, 1, 1)?;
-        let (sr_cond_model, sr_bin_boundaries) =
-            if let Some(sr) = sr_bin_boundaries.clone() {
-                if let Some(cond_type) = cond_type {
-                    let sr_len = sr.len() + 1;
-                    let vb_sr = vb.pp("sr_cond_model");
-                    let mut sr_cond_model = vec![];
-                    for (i, &input_dim) in input_channels_vec.iter().enumerate() {
-                        let layer = SampleRateConditionLayer::new(
-                            vb_sr.pp(i + 2),
-                            input_dim,
-                            sr_len,
-                            cond_type.clone(),
-                        )?;
-                        sr_cond_model.push(layer);
-                    }
-                    (Some(sr_cond_model), Some(sr))
-                } else {
-                    (None, None)
+        let (sr_cond_model, sr_bin_boundaries) = if let Some(sr) = sr_bin_boundaries.clone() {
+            if let Some(cond_type) = cond_type {
+                let sr_len = sr.len() + 1;
+                let vb_sr = vb.pp("sr_cond_model");
+                let mut sr_cond_model = vec![];
+                for (i, &input_dim) in input_channels_vec.iter().enumerate() {
+                    let layer = SampleRateConditionLayer::new(
+                        vb_sr.pp(i + 2),
+                        input_dim,
+                        sr_len,
+                        cond_type.clone(),
+                    )?;
+                    sr_cond_model.push(layer);
                 }
+                (Some(sr_cond_model), Some(sr))
             } else {
                 (None, None)
-            };
+            }
+        } else {
+            (None, None)
+        };
         Ok(Self {
             model0,
             model1,

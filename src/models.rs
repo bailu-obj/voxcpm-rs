@@ -13,9 +13,7 @@ use crate::{
     generate::VoxCPMGenerationConfig,
     linear::{linear_x, LinearX},
     minicpm4::MiniCPMModel,
-    profile::{
-        profile_stream_enabled, stage_capture_enabled, InferenceStepProfile, StageProfile,
-    },
+    profile::{profile_stream_enabled, stage_capture_enabled, InferenceStepProfile, StageProfile},
     quant::{QuantBuildCtx, QuantStats, VoxCPMQuantConfig},
     tokenizer::SingleChineseTokenizer,
     utils::audio::load_audio_with_resample,
@@ -36,6 +34,7 @@ struct GenerationParams {
     inference_timesteps: usize,
     cfg_value: f64,
     stream_decode_latent_batch: usize,
+    stream_decode_initial_latent_batch: usize,
     stop_check_interval: usize,
 }
 
@@ -47,6 +46,7 @@ impl GenerationParams {
             inference_timesteps: config.inference_timesteps.max(1),
             cfg_value: config.cfg_value,
             stream_decode_latent_batch: config.stream_decode_latent_batch(),
+            stream_decode_initial_latent_batch: config.stream_decode_initial_latent_batch(),
             stop_check_interval: config.stop_check_interval.max(1),
         }
     }
@@ -67,8 +67,20 @@ impl ScalarQuantizationLayer {
         scale: usize,
         qctx: &QuantBuildCtx,
     ) -> Result<Self> {
-        let in_proj = linear_x(in_dim, laten_dim, vb.pp("in_proj"), &qctx.pp("in_proj"), true)?;
-        let out_proj = linear_x(laten_dim, out_dim, vb.pp("out_proj"), &qctx.pp("out_proj"), true)?;
+        let in_proj = linear_x(
+            in_dim,
+            laten_dim,
+            vb.pp("in_proj"),
+            &qctx.pp("in_proj"),
+            true,
+        )?;
+        let out_proj = linear_x(
+            laten_dim,
+            out_dim,
+            vb.pp("out_proj"),
+            &qctx.pp("out_proj"),
+            true,
+        )?;
         Ok(Self {
             scale,
             in_proj,
@@ -318,7 +330,10 @@ impl VoxCPMLocDiT {
         let hidden_dim = x.dim(D::Minus1)?;
         let mu_width = mu.dim(D::Minus1)?;
         let (x, prefix_tokens) = if mu_width == hidden_dim {
-            (Tensor::cat(&[mu.add(&t_total)?.unsqueeze(1)?, cond, x], 1)?, 1)
+            (
+                Tensor::cat(&[mu.add(&t_total)?.unsqueeze(1)?, cond, x], 1)?,
+                1,
+            )
         } else {
             let b = mu.dim(0)?;
             let mu_tokens = mu.reshape((b, (), hidden_dim))?;
@@ -886,7 +901,14 @@ impl VoxCPMModel {
         prompt_text: Option<String>,
         prompt_wav_path: Option<String>,
         prompt_cache: Option<&HashMap<String, Tensor>>,
-    ) -> Result<(Tensor, Tensor, Tensor, Tensor, usize, Option<VoxCPM2InputLayout>)> {
+    ) -> Result<(
+        Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
+        usize,
+        Option<VoxCPM2InputLayout>,
+    )> {
         let target_text_length = self.tokenizer.encode(target_text.clone())?.len();
 
         if let Some(cache) = prompt_cache {
@@ -1117,8 +1139,14 @@ impl VoxCPMModel {
         let (text_token, text_mask, audio_feat, audio_mask, target_text_length, _layout) =
             self.prepare_full_inputs(target_text, prompt_text, prompt_wav_path, None)?;
         let params = GenerationParams::resolve(config, target_text_length);
-        let decode_audio =
-            self._generate(&text_token, &text_mask, &audio_feat, &audio_mask, params, None)?;
+        let decode_audio = self._generate(
+            &text_token,
+            &text_mask,
+            &audio_feat,
+            &audio_mask,
+            params,
+            None,
+        )?;
         Ok(decode_audio)
     }
 
@@ -1149,8 +1177,13 @@ impl VoxCPMModel {
         if let Some(start) = vae_start {
             StageProfile::add_vae_decode(start.elapsed());
         }
+        let boundary_trim = self.chunk_size;
         let audio_len = decode_audio.dim(D::Minus1)?;
-        let decode_audio = decode_audio.narrow(D::Minus1, 640, audio_len - 1280)?;
+        let decode_audio = decode_audio.narrow(
+            D::Minus1,
+            boundary_trim,
+            audio_len.saturating_sub(2 * boundary_trim),
+        )?;
         Ok(decode_audio)
     }
 
@@ -1167,6 +1200,7 @@ impl VoxCPMModel {
         let text_mask = text_mask.unsqueeze(0)?;
         let audio_feat = audio_feat.unsqueeze(0)?.to_dtype(self.dtype)?;
         let audio_mask = audio_mask.unsqueeze(0)?;
+        let boundary_trim_samples = self.chunk_size;
         let inf_stream = self.inference_stream(
             &text_token,
             &text_mask,
@@ -1179,10 +1213,13 @@ impl VoxCPMModel {
         Ok(VoxCPMGenerateStream {
             inf_stream,
             vae_state: None,
-            skipped_first: false,
-            pending_latents: Vec::with_capacity(params.stream_decode_latent_batch),
+            pending_latents: Vec::with_capacity(params.stream_decode_initial_latent_batch),
             stream_decode_latent_batch: params.stream_decode_latent_batch,
+            stream_decode_initial_latent_batch: params.stream_decode_initial_latent_batch,
+            initial_decode_done: false,
             pending_chunk: None,
+            boundary_trim_samples,
+            leading_trim_remaining: boundary_trim_samples,
             profile_enabled: profile_stream_enabled() || stage_capture_enabled(),
             profile_inf_time: Duration::ZERO,
             profile_vae_time: Duration::ZERO,
@@ -1460,7 +1497,9 @@ impl<'a> Iterator for VoxCPMInferenceStream<'a> {
             return None;
         }
 
-        let dit_hidden = match self.model.dit_hidden_from_lm(&self.lm_hidden, &self.residual_hidden)
+        let dit_hidden = match self
+            .model
+            .dit_hidden_from_lm(&self.lm_hidden, &self.residual_hidden)
         {
             Ok(t) => t,
             Err(e) => return Some(Err(e.into())),
@@ -1490,8 +1529,7 @@ impl<'a> Iterator for VoxCPMInferenceStream<'a> {
         };
         self.prefix_feat_cond = pred_feat;
         let should_check_stop = self.i > self.params.min_len
-            && (self.i % self.params.stop_check_interval == 0
-                || self.i + 1 >= self.params.max_len);
+            && (self.i % self.params.stop_check_interval == 0 || self.i + 1 >= self.params.max_len);
         if should_check_stop {
             let stop_start = self.step_profile.as_ref().map(|_| Instant::now());
             let stop_flag = match self.model.stop_proj.forward(&self.lm_hidden) {
@@ -1620,10 +1658,14 @@ impl<'a> Drop for VoxCPMInferenceStream<'a> {
 pub struct VoxCPMGenerateStream<'a> {
     inf_stream: VoxCPMInferenceStream<'a>,
     vae_state: Option<crate::audio_vae::DecoderState>,
-    skipped_first: bool,
     pending_latents: Vec<Tensor>,
     stream_decode_latent_batch: usize,
+    stream_decode_initial_latent_batch: usize,
+    initial_decode_done: bool,
     pending_chunk: Option<Tensor>,
+    /// VAE hop / chunk size; matches batch `decode()` leading+trailing trim (one chunk each end).
+    boundary_trim_samples: usize,
+    leading_trim_remaining: usize,
     profile_enabled: bool,
     profile_inf_time: Duration,
     profile_vae_time: Duration,
@@ -1632,17 +1674,64 @@ pub struct VoxCPMGenerateStream<'a> {
     finished: bool,
 }
 
+/// Trim VAE boundary padding from a streaming decode chunk to match batch `decode()` output.
+///
+/// Returns `None` when the chunk is fully consumed by trim (caller should skip yield).
+pub(crate) fn trim_stream_audio_chunk(
+    audio: Tensor,
+    boundary_trim: usize,
+    leading_trim_remaining: &mut usize,
+    apply_trailing_trim: bool,
+) -> Result<Option<Tensor>> {
+    let audio_len = audio.dim(D::Minus1)?;
+    let mut start = 0usize;
+    if *leading_trim_remaining > 0 {
+        let lead = (*leading_trim_remaining).min(audio_len);
+        start = lead;
+        *leading_trim_remaining -= lead;
+    }
+    let available = audio_len.saturating_sub(start);
+    let trailing = if apply_trailing_trim {
+        boundary_trim.min(available)
+    } else {
+        0
+    };
+    let len = available.saturating_sub(trailing);
+    if len == 0 {
+        return Ok(None);
+    }
+    Ok(Some(audio.narrow(D::Minus1, start, len)?))
+}
+
 impl<'a> VoxCPMGenerateStream<'a> {
+    fn prepare_stream_chunk(&mut self, audio: Tensor, final_chunk: bool) -> Result<Option<Tensor>> {
+        trim_stream_audio_chunk(
+            audio,
+            self.boundary_trim_samples,
+            &mut self.leading_trim_remaining,
+            final_chunk,
+        )
+    }
+
+    fn required_latent_batch(&self, force: bool) -> usize {
+        if force {
+            1
+        } else if self.initial_decode_done {
+            self.stream_decode_latent_batch
+        } else {
+            self.stream_decode_initial_latent_batch
+        }
+    }
+
     fn decode_pending_latents(&mut self, force: bool) -> Option<Result<Tensor>> {
-        if self.pending_latents.is_empty()
-            || (!force && self.pending_latents.len() < self.stream_decode_latent_batch)
-        {
+        let required = self.required_latent_batch(force);
+        if self.pending_latents.is_empty() || (!force && self.pending_latents.len() < required) {
             return None;
         }
 
         let latents = std::mem::replace(
             &mut self.pending_latents,
-            Vec::with_capacity(self.stream_decode_latent_batch),
+            Vec::with_capacity(self.stream_decode_latent_batch.max(required)),
         );
         let model_dtype = self.inf_stream.model.dtype;
         let latents: Vec<Tensor> = match latents
@@ -1666,12 +1755,11 @@ impl<'a> VoxCPMGenerateStream<'a> {
         };
 
         let vae_start = self.profile_enabled.then(Instant::now);
-        let audio_chunk = match self
-            .inf_stream
-            .model
-            .audio_vae
-            .decode_stream(&latent_vae, self.vae_state.as_mut().unwrap(), None)
-        {
+        let audio_chunk = match self.inf_stream.model.audio_vae.decode_stream(
+            &latent_vae,
+            self.vae_state.as_mut().unwrap(),
+            None,
+        ) {
             Ok(t) => match t.squeeze(1) {
                 Ok(t) => t,
                 Err(e) => return Some(Err(anyhow::Error::from(e))),
@@ -1682,6 +1770,7 @@ impl<'a> VoxCPMGenerateStream<'a> {
             self.profile_vae_time += start.elapsed();
             self.profile_chunks += latents.len();
         }
+        self.initial_decode_done = true;
 
         Some(Ok(audio_chunk))
     }
@@ -1733,21 +1822,23 @@ impl<'a> Iterator for VoxCPMGenerateStream<'a> {
                         self.vae_state = Some(state);
                     }
 
-                    if !self.skipped_first {
-                        self.skipped_first = true;
-                        // Latent 0 skipped
-                    } else {
-                        self.pending_latents.push(latent);
-                        if let Some(decoded) = self.decode_pending_latents(false) {
-                            match decoded {
-                                Ok(audio_chunk) => {
-                                    if let Some(to_yield) = self.pending_chunk.replace(audio_chunk)
-                                    {
-                                        return Some(Ok(to_yield));
+                    self.pending_latents.push(latent);
+                    if let Some(decoded) = self.decode_pending_latents(false) {
+                        match decoded {
+                            Ok(audio_chunk) => {
+                                match self.prepare_stream_chunk(audio_chunk, false) {
+                                    Ok(Some(trimmed)) => {
+                                        if let Some(to_yield) =
+                                            self.pending_chunk.replace(trimmed)
+                                        {
+                                            return Some(Ok(to_yield));
+                                        }
                                     }
+                                    Ok(None) => {}
+                                    Err(e) => return Some(Err(e)),
                                 }
-                                Err(e) => return Some(Err(e)),
                             }
+                            Err(e) => return Some(Err(e)),
                         }
                     }
                 }
@@ -1756,16 +1847,24 @@ impl<'a> Iterator for VoxCPMGenerateStream<'a> {
         }
         if let Some(decoded) = self.decode_pending_latents(true) {
             match decoded {
-                Ok(audio_chunk) => {
-                    if let Some(to_yield) = self.pending_chunk.replace(audio_chunk) {
-                        return Some(Ok(to_yield));
+                Ok(audio_chunk) => match self.prepare_stream_chunk(audio_chunk, false) {
+                    Ok(Some(trimmed)) => {
+                        if let Some(to_yield) = self.pending_chunk.replace(trimmed) {
+                            return Some(Ok(to_yield));
+                        }
                     }
-                }
+                    Ok(None) => {}
+                    Err(e) => return Some(Err(e)),
+                },
                 Err(e) => return Some(Err(e)),
             }
         }
         if let Some(to_yield) = self.pending_chunk.take() {
-            return Some(Ok(to_yield));
+            match self.prepare_stream_chunk(to_yield, true) {
+                Ok(Some(trimmed)) => return Some(Ok(trimmed)),
+                Ok(None) => {}
+                Err(e) => return Some(Err(e)),
+            }
         }
 
         self.finished = true;
@@ -1852,5 +1951,77 @@ impl VoxCPMModel {
             params,
             layout,
         )
+    }
+}
+
+#[cfg(test)]
+mod stream_trim_tests {
+    use super::*;
+    use candle_core::Device;
+
+    fn mono_chunk(values: &[f32]) -> Result<Tensor> {
+        Ok(Tensor::from_slice(values, values.len(), &Device::Cpu)?.unsqueeze(0)?)
+    }
+
+    fn chunk_values(chunk: &Tensor) -> Result<Vec<f32>> {
+        Ok(chunk.squeeze(0)?.to_vec1()?)
+    }
+
+    #[test]
+    fn leading_trim_removes_boundary_prefix() -> Result<()> {
+        let boundary = 4usize;
+        let mut leading = boundary;
+        let audio = mono_chunk(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0])?;
+        let trimmed = trim_stream_audio_chunk(audio, boundary, &mut leading, false)?.unwrap();
+        assert_eq!(leading, 0);
+        assert_eq!(chunk_values(&trimmed)?, vec![4.0, 5.0, 6.0, 7.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn trailing_trim_on_final_chunk() -> Result<()> {
+        let boundary = 3usize;
+        let mut leading = 0usize;
+        let audio = mono_chunk(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0])?;
+        let trimmed = trim_stream_audio_chunk(audio, boundary, &mut leading, true)?.unwrap();
+        assert_eq!(chunk_values(&trimmed)?, vec![1.0, 2.0, 3.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn leading_and_trailing_trim_together() -> Result<()> {
+        let boundary = 2usize;
+        let mut leading = boundary;
+        let audio = mono_chunk(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0])?;
+        let trimmed = trim_stream_audio_chunk(audio, boundary, &mut leading, true)?.unwrap();
+        assert_eq!(leading, 0);
+        assert_eq!(chunk_values(&trimmed)?, vec![2.0, 3.0, 4.0, 5.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn leading_trim_spans_multiple_chunks() -> Result<()> {
+        let boundary = 5usize;
+        let mut leading = boundary;
+        let first = mono_chunk(&[0.0, 1.0, 2.0])?;
+        assert!(trim_stream_audio_chunk(first, boundary, &mut leading, false)?.is_none());
+        assert_eq!(leading, 2);
+        let second = mono_chunk(&[3.0, 4.0, 5.0, 6.0, 7.0])?;
+        let trimmed = trim_stream_audio_chunk(second, boundary, &mut leading, false)?.unwrap();
+        assert_eq!(leading, 0);
+        assert_eq!(chunk_values(&trimmed)?, vec![5.0, 6.0, 7.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn fully_consumed_by_trim_returns_none() -> Result<()> {
+        let boundary = 4usize;
+        let mut leading = 0usize;
+        let audio = mono_chunk(&[1.0, 2.0, 3.0, 4.0])?;
+        assert!(
+            trim_stream_audio_chunk(audio, boundary, &mut leading, true)?
+                .is_none()
+        );
+        Ok(())
     }
 }

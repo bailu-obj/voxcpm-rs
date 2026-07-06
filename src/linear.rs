@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
-use candle_core::{Device, DType, Module, Tensor};
+use candle_core::{DType, Device, Module, Tensor};
 use candle_nn::{linear, linear_no_bias, Linear, VarBuilder};
 
 use crate::quant::{quant_audit_enabled, quant_audit_log, QuantBuildCtx, VoxCPMWeightQuant};
@@ -126,7 +126,8 @@ impl QLinear {
         match linear.bias() {
             None => Ok(None),
             Some(b) => {
-                let b = b.to_device(&Device::Cpu)?
+                let b = b
+                    .to_device(&Device::Cpu)?
                     .to_dtype(dtype)?
                     .to_device(device)?;
                 Ok(Some(b))
@@ -203,7 +204,11 @@ pub fn linear_x(
     linear_x_from_linear(ln, ctx, &device)
 }
 
-pub fn linear_x_from_linear(linear: Linear, ctx: &QuantBuildCtx, device: &Device) -> Result<LinearX> {
+pub fn linear_x_from_linear(
+    linear: Linear,
+    ctx: &QuantBuildCtx,
+    device: &Device,
+) -> Result<LinearX> {
     if !ctx.should_quantize() {
         if quant_audit_enabled() {
             quant_audit_log(&ctx.module_path, "skipped");
@@ -287,8 +292,8 @@ mod tests {
         let ln = Linear::new(weight, bias.clone());
         let y_ref = ln.forward(&x)?;
 
-        let ctx = QuantBuildCtx::root(VoxCPMQuantConfig::with_weight(VoxCPMWeightQuant::Q8_0))
-            .pp("test");
+        let ctx =
+            QuantBuildCtx::root(VoxCPMQuantConfig::with_weight(VoxCPMWeightQuant::Q8_0)).pp("test");
         let q = linear_x_from_linear(ln, &ctx, &device)?;
         let y_q = q.forward(&x)?;
 
@@ -329,8 +334,8 @@ mod tests {
         let x = Tensor::randn(0f32, 1f32, (2, 4, 32), &device)?;
         let ln = Linear::new(weight, None);
         let y_ref = ln.forward(&x)?;
-        let ctx = QuantBuildCtx::root(VoxCPMQuantConfig::with_weight(VoxCPMWeightQuant::Q8_0))
-            .pp("test");
+        let ctx =
+            QuantBuildCtx::root(VoxCPMQuantConfig::with_weight(VoxCPMWeightQuant::Q8_0)).pp("test");
         let q = linear_x_from_linear(ln, &ctx, &device)?;
         let y_q = q.forward(&x)?;
         assert!(max_abs_diff(&y_ref, &y_q)? < 0.05);

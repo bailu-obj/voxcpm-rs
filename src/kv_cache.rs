@@ -66,7 +66,7 @@ impl KvCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle_core::{Device, DType};
+    use candle_core::{DType, Device};
 
     #[test]
     fn kv_cache_append_and_read() -> Result<()> {

@@ -17,7 +17,9 @@ pub mod tokenizer;
 pub mod utils;
 
 pub use config::{AudioVaeConfig, VoxCPMConfig};
-pub use generate::{VoxCPMGenerationConfig, VoxCPMGenerator, VoxCPMGeneratorOptions, COMPARE_FP_DEFAULT_SEED};
+pub use generate::{
+    VoxCPMGenerationConfig, VoxCPMGenerator, VoxCPMGeneratorOptions, COMPARE_FP_DEFAULT_SEED,
+};
 pub use profile::{
     audio_quality_ok, bench_profile_enabled, bottleneck_hint, compare_fp_enabled,
     compare_fp_min_correlation, pcm_correlation, reset_stage_profile, take_stage_profile,

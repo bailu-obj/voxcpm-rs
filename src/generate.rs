@@ -9,10 +9,12 @@ use crate::{
     models::VoxCPMModel,
     quant::VoxCPMQuantConfig,
     tokenizer::SingleChineseTokenizer,
-    utils::device::{get_compute_dtype, get_device, get_quant_compute_dtype, get_vae_compute_dtype},
+    utils::device::{
+        get_compute_dtype, get_device, get_quant_compute_dtype, get_vae_compute_dtype,
+    },
 };
 
-const DEFAULT_INFERENCE_TIMESTEPS: usize = 8;
+const DEFAULT_INFERENCE_TIMESTEPS: usize = 10;
 pub const DEFAULT_STREAM_DECODE_LATENT_BATCH: usize = 8;
 const DEFAULT_STOP_CHECK_INTERVAL: usize = 4;
 
@@ -44,6 +46,8 @@ pub struct VoxCPMGenerationConfig {
     pub retry_badcase: bool,
     pub retry_badcase_ratio_threshold: f64,
     pub stream_decode_latent_batch: usize,
+    /// First streaming VAE decode waits for this many latents (0 = auto: max(16, 2× batch)).
+    pub stream_decode_initial_latent_batch: usize,
     /// Run stop-head every N latents after `min_len` (1 = every step).
     pub stop_check_interval: usize,
 }
@@ -64,6 +68,7 @@ impl VoxCPMGenerationConfig {
             retry_badcase: true,
             retry_badcase_ratio_threshold: 6.0,
             stream_decode_latent_batch: DEFAULT_STREAM_DECODE_LATENT_BATCH,
+            stream_decode_initial_latent_batch: 0,
             stop_check_interval: DEFAULT_STOP_CHECK_INTERVAL,
         }
     }
@@ -77,6 +82,7 @@ impl VoxCPMGenerationConfig {
             retry_badcase: true,
             retry_badcase_ratio_threshold: 3.0,
             stream_decode_latent_batch: DEFAULT_STREAM_DECODE_LATENT_BATCH,
+            stream_decode_initial_latent_batch: 0,
             stop_check_interval: DEFAULT_STOP_CHECK_INTERVAL,
         }
     }
@@ -91,6 +97,7 @@ impl VoxCPMGenerationConfig {
             retry_badcase: true,
             retry_badcase_ratio_threshold: 3.0,
             stream_decode_latent_batch: 2,
+            stream_decode_initial_latent_batch: 0,
             stop_check_interval: 2,
         }
     }
@@ -116,6 +123,7 @@ impl VoxCPMGenerationConfig {
             retry_badcase: true,
             retry_badcase_ratio_threshold: 3.0,
             stream_decode_latent_batch: 8,
+            stream_decode_initial_latent_batch: 0,
             stop_check_interval: 4,
         }
     }
@@ -131,6 +139,15 @@ impl VoxCPMGenerationConfig {
 
     pub(crate) fn stream_decode_latent_batch(self) -> usize {
         self.stream_decode_latent_batch.max(1)
+    }
+
+    pub(crate) fn stream_decode_initial_latent_batch(self) -> usize {
+        let batch = self.stream_decode_latent_batch();
+        if self.stream_decode_initial_latent_batch > 0 {
+            self.stream_decode_initial_latent_batch.max(batch)
+        } else {
+            batch.saturating_mul(2).max(16)
+        }
     }
 }
 
@@ -164,7 +181,9 @@ impl VoxCPMGenerator {
         let vae_safetensors = find_vae_safetensors(path)?;
         let (vb_vae, _vae_dtype) = if !vae_safetensors.is_empty() {
             let vae_dtype = get_vae_compute_dtype(vae_dtype_override, DType::F32, &device);
-            let vb = unsafe { VarBuilder::from_mmaped_safetensors(&vae_safetensors, vae_dtype, &device)? };
+            let vb = unsafe {
+                VarBuilder::from_mmaped_safetensors(&vae_safetensors, vae_dtype, &device)?
+            };
             (vb, vae_dtype)
         } else {
             let model_list = find_type_files(path, "pth")?;
@@ -271,9 +290,7 @@ impl VoxCPMGenerator {
             prompt_cache: None,
             sample_rate: out_sample_rate,
             model_name,
-            generation_seed: options
-                .seed
-                .or_else(|| parse_seed_from_env()),
+            generation_seed: options.seed.or_else(|| parse_seed_from_env()),
         })
     }
 
@@ -389,11 +406,10 @@ impl VoxCPMGenerator {
         config: VoxCPMGenerationConfig,
     ) -> Result<Box<dyn Iterator<Item = Result<Vec<i16>>> + '_>> {
         let stream = self.generate_stream_with_config(target_text, config)?;
-        let iter = stream.map(move |res| match res {
-            std::result::Result::Ok(tensor) => crate::utils::audio::to_pcm_stream_chunk(&tensor),
-            Err(e) => Err(e),
-        });
-        Ok(Box::new(iter))
+        Ok(Box::new(PcmStreamIter {
+            inner: stream,
+            normalizer: crate::utils::audio::StreamPcmNormalizer::new(),
+        }))
     }
 
     /// Get sample rate
@@ -424,6 +440,26 @@ impl VoxCPMGenerator {
     #[must_use]
     pub fn quant_stats(&self) -> crate::quant::QuantStats {
         self.voxcpm.quant_stats()
+    }
+}
+
+struct PcmStreamIter<'a> {
+    inner: Box<dyn Iterator<Item = Result<Tensor>> + 'a>,
+    normalizer: crate::utils::audio::StreamPcmNormalizer,
+}
+
+impl Iterator for PcmStreamIter<'_> {
+    type Item = Result<Vec<i16>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|res| {
+            res.and_then(|tensor| {
+                crate::utils::audio::to_pcm_stream_chunk_with_normalizer(
+                    &tensor,
+                    &mut self.normalizer,
+                )
+            })
+        })
     }
 }
 

@@ -240,7 +240,8 @@ impl MiniCPMModel {
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_layers = vb.pp("layers");
         for i in 0..cfg.num_hidden_layers {
-            let layer = MiniCPMDecoderLayer::new(vb_layers.pp(i), &cfg, &qctx.pp(&format!("layers.{i}")))?;
+            let layer =
+                MiniCPMDecoderLayer::new(vb_layers.pp(i), &cfg, &qctx.pp(&format!("layers.{i}")))?;
             layers.push(layer);
         }
         let norm = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("norm"))?;
@@ -259,7 +260,11 @@ impl MiniCPMModel {
         })
     }
 
-    fn rope_cos_sin(&mut self, position_id: usize, seq_len: usize) -> Result<(Option<Tensor>, Option<Tensor>)> {
+    fn rope_cos_sin(
+        &mut self,
+        position_id: usize,
+        seq_len: usize,
+    ) -> Result<(Option<Tensor>, Option<Tensor>)> {
         if let Some(rope_emb) = &mut self.rope_emb {
             let (cos, sin) = rope_emb.forward(position_id, seq_len)?;
             Ok((Some(cos), Some(sin)))
@@ -329,8 +334,12 @@ impl MiniCPMModel {
             .map(|(_, mask)| mask);
 
         for decode_layer in &mut self.layers {
-            hidden_states =
-                decode_layer.forward_with_cache(&hidden_states, cos.as_ref(), sin.as_ref(), attention_mask)?;
+            hidden_states = decode_layer.forward_with_cache(
+                &hidden_states,
+                cos.as_ref(),
+                sin.as_ref(),
+                attention_mask,
+            )?;
         }
         hidden_states = self.norm.forward(&hidden_states)?;
 

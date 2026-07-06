@@ -25,8 +25,7 @@ impl SingleChineseTokenizer {
         for (token, token_id) in tokenizer.get_vocab(false) {
             let clean_token = token.replace("▁", "");
             let mut chars = clean_token.chars();
-            let is_multichar_cjk =
-                chars.clone().count() >= 2 && chars.all(Self::is_cjk);
+            let is_multichar_cjk = chars.clone().count() >= 2 && chars.all(Self::is_cjk);
             if is_multichar_cjk {
                 let char_ids = clean_token
                     .chars()

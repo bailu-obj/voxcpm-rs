@@ -1,9 +1,9 @@
 //! Weight quantization configuration for VoxCPM linear layers.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::str::FromStr;
-use std::cell::RefCell;
 use std::time::Duration;
 
 /// Supported in-situ weight quantization modes (Candle GGUF dtypes).
@@ -142,12 +142,7 @@ impl VoxCPMQuantConfig {
     /// Whether a fully-qualified module path should remain in full precision.
     #[must_use]
     pub fn should_skip_module(&self, module_path: &str) -> bool {
-        const DEFAULT_SKIP: &[&str] = &[
-            "embed_tokens",
-            "stop_head",
-            "stop_proj",
-            "fsq_layer",
-        ];
+        const DEFAULT_SKIP: &[&str] = &["embed_tokens", "stop_head", "stop_proj", "fsq_layer"];
         for pat in DEFAULT_SKIP {
             if module_path.contains(pat) {
                 return true;
@@ -203,7 +198,10 @@ impl QuantStats {
         self.quantized += 1;
         self.dense_bytes += dense_bytes;
         self.quantized_bytes += quantized_bytes;
-        *self.by_actual_dtype.entry(actual_dtype.to_string()).or_default() += 1;
+        *self
+            .by_actual_dtype
+            .entry(actual_dtype.to_string())
+            .or_default() += 1;
         if fallback_to_q8 && requested.is_k_quant() {
             self.fallback_q8 += 1;
         }
@@ -334,9 +332,13 @@ impl QuantBuildCtx {
         fallback_to_q8: bool,
     ) {
         let requested = self.config.weight;
-        self.stats
-            .borrow_mut()
-            .record_quantized(requested, actual_dtype, dense_bytes, quantized_bytes, fallback_to_q8);
+        self.stats.borrow_mut().record_quantized(
+            requested,
+            actual_dtype,
+            dense_bytes,
+            quantized_bytes,
+            fallback_to_q8,
+        );
     }
 
     pub fn add_quant_load(&self, d: Duration) {

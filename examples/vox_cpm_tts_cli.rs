@@ -6,9 +6,9 @@ use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::time::Instant;
 use voxcpm_rs::{
-    audio_quality_ok,     compare_fp_enabled, compare_fp_min_correlation, pcm_correlation, utils::device::parse_dtype_option,
-    COMPARE_FP_DEFAULT_SEED, VoxCPMGenerationConfig, VoxCPMGenerator,
-    VoxCPMGeneratorOptions, VoxCPMQuantConfig, VoxCPMWeightQuant,
+    audio_quality_ok, compare_fp_enabled, compare_fp_min_correlation, pcm_correlation,
+    utils::device::parse_dtype_option, VoxCPMGenerationConfig, VoxCPMGenerator,
+    VoxCPMGeneratorOptions, VoxCPMQuantConfig, VoxCPMWeightQuant, COMPARE_FP_DEFAULT_SEED,
 };
 
 #[derive(Parser, Debug)]
@@ -92,8 +92,7 @@ fn main() -> Result<()> {
     options.seed = compare_seed;
 
     println!("Loading model...");
-    let mut generator =
-        VoxCPMGenerator::new_with_options(args.model.to_str().unwrap(), &options)?;
+    let mut generator = VoxCPMGenerator::new_with_options(args.model.to_str().unwrap(), &options)?;
     println!("✓ Model loaded");
 
     let use_ref = match (&args.ref_wav, &args.ref_text) {
@@ -304,7 +303,11 @@ fn text_preview(s: &str, max_chars: usize) -> String {
     }
 }
 
-fn build_options(args: &Args, quant: VoxCPMWeightQuant, seed: Option<u64>) -> VoxCPMGeneratorOptions {
+fn build_options(
+    args: &Args,
+    quant: VoxCPMWeightQuant,
+    seed: Option<u64>,
+) -> VoxCPMGeneratorOptions {
     let mut options = VoxCPMGeneratorOptions::default();
     options.device_id = args.device_id;
     options.dtype = parse_dtype_option(Some(&args.dtype));
@@ -314,9 +317,15 @@ fn build_options(args: &Args, quant: VoxCPMWeightQuant, seed: Option<u64>) -> Vo
     options
 }
 
-fn init_generator(args: &Args, quant: VoxCPMWeightQuant, seed: Option<u64>) -> Result<VoxCPMGenerator> {
-    let mut generator =
-        VoxCPMGenerator::new_with_options(args.model.to_str().unwrap(), &build_options(args, quant, seed))?;
+fn init_generator(
+    args: &Args,
+    quant: VoxCPMWeightQuant,
+    seed: Option<u64>,
+) -> Result<VoxCPMGenerator> {
+    let mut generator = VoxCPMGenerator::new_with_options(
+        args.model.to_str().unwrap(),
+        &build_options(args, quant, seed),
+    )?;
     if let (Some(wav), Some(text)) = (&args.ref_wav, &args.ref_text) {
         generator.build_prompt_cache(text.clone(), wav.to_string_lossy().to_string())?;
     }
@@ -331,7 +340,12 @@ fn generation_config(args: &Args) -> VoxCPMGenerationConfig {
     }
 }
 
-fn generate_fp_pcm(args: &Args, texts: &[String], stream: bool, seed: Option<u64>) -> Result<Vec<i16>> {
+fn generate_fp_pcm(
+    args: &Args,
+    texts: &[String],
+    stream: bool,
+    seed: Option<u64>,
+) -> Result<Vec<i16>> {
     let mut generator = init_generator(args, VoxCPMWeightQuant::None, seed)?;
     let config = generation_config(args);
     let text = texts

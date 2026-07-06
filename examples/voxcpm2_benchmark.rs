@@ -7,9 +7,8 @@ use std::time::Instant;
 use voxcpm_rs::{
     audio_quality_ok, bench_profile_enabled, bottleneck_hint, compare_fp_enabled,
     compare_fp_min_correlation, pcm_correlation, reset_stage_profile, take_stage_profile,
-    BenchmarkMetrics, QuantStats, StageProfile, COMPARE_FP_DEFAULT_SEED,
-    VoxCPMGenerationConfig, VoxCPMGenerator, VoxCPMGeneratorOptions, VoxCPMQuantConfig,
-    VoxCPMWeightQuant,
+    BenchmarkMetrics, QuantStats, StageProfile, VoxCPMGenerationConfig, VoxCPMGenerator,
+    VoxCPMGeneratorOptions, VoxCPMQuantConfig, VoxCPMWeightQuant, COMPARE_FP_DEFAULT_SEED,
 };
 
 #[derive(Parser, Debug)]
@@ -62,6 +61,22 @@ struct Args {
     /// Measured runs; report median wall/RTF when >1.
     #[arg(long, default_value = "1")]
     runs: usize,
+
+    /// Latents per VAE decode after the first chunk (streaming only).
+    #[arg(long)]
+    stream_decode_latent_batch: Option<usize>,
+
+    /// First streaming VAE decode batch in latents (streaming only); 0 = vendor auto.
+    #[arg(long)]
+    stream_decode_initial_latent_batch: Option<usize>,
+
+    /// Run stop-head every N latents after min_len (streaming only).
+    #[arg(long)]
+    stop_check_interval: Option<usize>,
+
+    /// Pick Euler steps from target text length (`adaptive_for_text_len`).
+    #[arg(long, default_value = "false")]
+    adaptive_timesteps: bool,
 }
 
 fn main() -> Result<()> {
@@ -160,8 +175,7 @@ fn run_measured(
     }
 
     let load_start = Instant::now();
-    let mut generator =
-        VoxCPMGenerator::new_with_options(args.model.to_str().unwrap(), options)?;
+    let mut generator = VoxCPMGenerator::new_with_options(args.model.to_str().unwrap(), options)?;
     let load_secs = load_start.elapsed().as_secs_f64();
     let quant_stats = generator.quant_stats();
 
@@ -216,11 +230,23 @@ fn build_options(
 }
 
 fn build_generation_config(args: &Args) -> VoxCPMGenerationConfig {
-    if args.ref_wav.is_some() && args.ref_text.is_some() {
+    let mut config = if args.adaptive_timesteps {
+        VoxCPMGenerationConfig::adaptive_for_text_len(args.text.chars().count())
+    } else if args.ref_wav.is_some() && args.ref_text.is_some() {
         VoxCPMGenerationConfig::voice_clone()
     } else {
         VoxCPMGenerationConfig::simple()
+    };
+    if let Some(n) = args.stream_decode_latent_batch {
+        config.stream_decode_latent_batch = n;
     }
+    if let Some(n) = args.stream_decode_initial_latent_batch {
+        config.stream_decode_initial_latent_batch = n;
+    }
+    if let Some(n) = args.stop_check_interval {
+        config.stop_check_interval = n;
+    }
+    config
 }
 
 fn run_generation(
@@ -228,8 +254,7 @@ fn run_generation(
     options: VoxCPMGeneratorOptions,
     config: VoxCPMGenerationConfig,
 ) -> Result<(f64, f64, usize, Vec<i16>)> {
-    let mut generator =
-        VoxCPMGenerator::new_with_options(args.model.to_str().unwrap(), &options)?;
+    let mut generator = VoxCPMGenerator::new_with_options(args.model.to_str().unwrap(), &options)?;
     if let (Some(wav), Some(text)) = (&args.ref_wav, &args.ref_text) {
         generator.build_prompt_cache(text.clone(), wav.to_string_lossy().to_string())?;
     }

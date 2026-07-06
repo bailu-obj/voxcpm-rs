@@ -271,6 +271,43 @@ pub fn load_audio_with_resample(
     Ok(audio)
 }
 
+/// Tracks peak amplitude across streaming chunks so gain matches batch [`to_pcm`].
+#[derive(Debug, Clone, Default)]
+pub struct StreamPcmNormalizer {
+    running_peak: f32,
+}
+
+impl StreamPcmNormalizer {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Update running peak and convert mono float samples to i16 PCM.
+    pub fn normalize_chunk(&mut self, samples: &[f32]) -> Vec<i16> {
+        let chunk_peak = samples
+            .iter()
+            .copied()
+            .map(f32::abs)
+            .fold(0.0_f32, f32::max);
+        self.running_peak = self.running_peak.max(chunk_peak);
+        let scale = if self.running_peak > 1.0 {
+            32767.0 / self.running_peak
+        } else {
+            32767.0
+        };
+        samples
+            .iter()
+            .map(|&s| (s * scale).round() as i16)
+            .collect()
+    }
+
+    #[must_use]
+    pub fn running_peak(&self) -> f32 {
+        self.running_peak
+    }
+}
+
 /// Mono float samples to i16 with peak normalization (same rule everywhere we emit PCM).
 ///
 /// If max(|x|) ≤ 1, scales by 32767 so the waveform uses full i16 range when peaks reach ±1.
@@ -349,4 +386,40 @@ pub fn to_pcm_stream_chunk(audio: &Tensor) -> Result<Vec<i16>> {
     let audio = audio.squeeze(0)?;
     let audio_vec = audio.to_vec1::<f32>()?;
     Ok(float_mono_to_i16_peak_normalized(&audio_vec))
+}
+
+/// Streaming PCM conversion with utterance-level running peak (matches batch gain across chunks).
+pub fn to_pcm_stream_chunk_with_normalizer(
+    audio: &Tensor,
+    normalizer: &mut StreamPcmNormalizer,
+) -> Result<Vec<i16>> {
+    assert_eq!(audio.dim(0)?, 1, "audio channel must be 1");
+    let audio = audio.squeeze(0)?;
+    let audio_vec = audio.to_vec1::<f32>()?;
+    Ok(normalizer.normalize_chunk(&audio_vec))
+}
+
+#[cfg(test)]
+mod stream_pcm_normalizer_tests {
+    use super::*;
+
+    #[test]
+    fn running_peak_keeps_later_chunks_at_first_chunk_gain() {
+        let mut norm = StreamPcmNormalizer::new();
+        let loud = norm.normalize_chunk(&[3.0, -1.5, 0.5]);
+        assert!(loud.iter().all(|&s| s.abs() <= 32767));
+        let quiet = norm.normalize_chunk(&[0.2, -0.1]);
+        let scale = 32767.0 / 3.0;
+        assert_eq!(quiet[0], (0.2_f32 * scale).round() as i16);
+        assert_eq!(quiet[1], (-0.1_f32 * scale).round() as i16);
+    }
+
+    #[test]
+    fn running_peak_updates_when_later_chunk_is_louder() {
+        let mut norm = StreamPcmNormalizer::new();
+        let _ = norm.normalize_chunk(&[0.5, -0.5]);
+        assert!((norm.running_peak() - 0.5).abs() < 1e-6);
+        let _ = norm.normalize_chunk(&[2.0, -1.0]);
+        assert!((norm.running_peak() - 2.0).abs() < 1e-6);
+    }
 }

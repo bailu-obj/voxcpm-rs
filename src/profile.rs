@@ -100,10 +100,7 @@ impl StageProfile {
 
     pub fn store_inference(profile: &InferenceStepProfile, prefill: Option<Duration>) {
         if let Ok(mut guard) = STAGE_PROFILE.lock() {
-            let vae_decode_secs = guard
-                .as_ref()
-                .map(|s| s.vae_decode_secs)
-                .unwrap_or(0.0);
+            let vae_decode_secs = guard.as_ref().map(|s| s.vae_decode_secs).unwrap_or(0.0);
             *guard = Some(StageProfile {
                 prefill_secs: prefill.map(|d| d.as_secs_f64()).unwrap_or(0.0),
                 cfm_secs: profile.cfm.as_secs_f64(),
@@ -248,9 +245,7 @@ impl BenchmarkMetrics {
             .fp_correlation
             .map(|c| format!("{c:.6}"))
             .unwrap_or_else(|| "null".to_string());
-        let quant_part = quant_json
-            .map(|q| format!(",{q}"))
-            .unwrap_or_default();
+        let quant_part = quant_json.map(|q| format!(",{q}")).unwrap_or_default();
         println!(
             "VOXCPM_BENCH_JSON {{\"mode\":\"{label}\",\"load_secs\":{:.6},\"prompt_cache_secs\":{:.6},\"prefill_secs\":{:.6},\"ttfa_secs\":{:.6},\"wall_secs\":{:.6},\"audio_secs\":{:.6},\"rtf\":{:.6},\"latent_count\":{},\"pcm_chunks\":{},\"cfm_secs\":{:.6},\"stop_secs\":{:.6},\"lm_advance_secs\":{:.6},\"vae_decode_secs\":{:.6},\"fp_correlation\":{fp_corr}{quant_part}}}",
             self.load_secs,
@@ -362,7 +357,11 @@ pub fn audio_quality_ok(samples: &[i16]) -> bool {
         return false;
     }
     let mean: f64 = samples.iter().map(|&s| s as f64).sum::<f64>() / n;
-    let var: f64 = samples.iter().map(|&s| ((s as f64) - mean).powi(2)).sum::<f64>() / n;
+    let var: f64 = samples
+        .iter()
+        .map(|&s| ((s as f64) - mean).powi(2))
+        .sum::<f64>()
+        / n;
     var > 1e4
 }
 
