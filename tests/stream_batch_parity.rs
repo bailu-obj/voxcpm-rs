@@ -4,8 +4,8 @@
 //! `VOXCPM2_MODEL_PATH=models/VoxCPM-0.5B cargo test -p voxcpm-rs --test stream_batch_parity -- --ignored --nocapture`
 
 use voxcpm_rs::profile::pcm_correlation;
-use voxcpm_rs::{VoxCPMGenerationConfig, VoxCPMGenerator, COMPARE_FP_DEFAULT_SEED};
 use voxcpm_rs::VoxCPMGeneratorOptions;
+use voxcpm_rs::{VoxCPMGenerationConfig, VoxCPMGenerator, COMPARE_FP_DEFAULT_SEED};
 
 const ONSET_SAMPLES: usize = 96_000; // 2 s @ 48 kHz
 const MIN_ONSET_CORR: f64 = 0.95;
@@ -47,10 +47,7 @@ fn stream_concat_matches_batch_onset() -> anyhow::Result<()> {
     );
 
     let onset_len = ONSET_SAMPLES.min(batch_pcm.len()).min(stream_pcm.len());
-    let onset_corr = pcm_correlation(
-        &batch_pcm[..onset_len],
-        &stream_pcm[..onset_len],
-    );
+    let onset_corr = pcm_correlation(&batch_pcm[..onset_len], &stream_pcm[..onset_len]);
     let full_len = batch_pcm.len().min(stream_pcm.len());
     let full_corr = pcm_correlation(&batch_pcm[..full_len], &stream_pcm[..full_len]);
 

@@ -161,7 +161,6 @@ Override at runtime: `BAILU_VOXCPM_QUANT=none|q8_0|…`. Full operator guide: [`
 | `voice_clone()` | Reference-guided synthesis (default) |
 | `low_latency()` | Smaller VAE batches, fewer stop checks |
 | `metal_rtf()` | Metal throughput tuning |
-| `adaptive_for_text_len(n)` | Fewer Euler steps for short text |
 
 Key fields: `inference_timesteps`, `cfg_value`, `max_len`, `stream_decode_latent_batch`, `stop_check_interval`, `retry_badcase`.
 

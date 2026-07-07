@@ -102,17 +102,6 @@ impl VoxCPMGenerationConfig {
         }
     }
 
-    /// Adaptive Euler steps from target text length (short prompts use fewer steps).
-    pub fn adaptive_for_text_len(target_text_len: usize) -> Self {
-        let mut cfg = Self::voice_clone();
-        cfg.inference_timesteps = match target_text_len {
-            0..=20 => 6,
-            21..=60 => 8,
-            _ => 8,
-        };
-        cfg
-    }
-
     /// Metal GPU RTF preset: fewer Euler steps, less frequent stop syncs, larger VAE batches.
     pub fn metal_rtf() -> Self {
         Self {

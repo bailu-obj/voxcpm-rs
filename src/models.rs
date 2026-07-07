@@ -1828,8 +1828,7 @@ impl<'a> Iterator for VoxCPMGenerateStream<'a> {
                             Ok(audio_chunk) => {
                                 match self.prepare_stream_chunk(audio_chunk, false) {
                                     Ok(Some(trimmed)) => {
-                                        if let Some(to_yield) =
-                                            self.pending_chunk.replace(trimmed)
+                                        if let Some(to_yield) = self.pending_chunk.replace(trimmed)
                                         {
                                             return Some(Ok(to_yield));
                                         }
@@ -2018,10 +2017,7 @@ mod stream_trim_tests {
         let boundary = 4usize;
         let mut leading = 0usize;
         let audio = mono_chunk(&[1.0, 2.0, 3.0, 4.0])?;
-        assert!(
-            trim_stream_audio_chunk(audio, boundary, &mut leading, true)?
-                .is_none()
-        );
+        assert!(trim_stream_audio_chunk(audio, boundary, &mut leading, true)?.is_none());
         Ok(())
     }
 }

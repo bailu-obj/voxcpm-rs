@@ -73,10 +73,6 @@ struct Args {
     /// Run stop-head every N latents after min_len (streaming only).
     #[arg(long)]
     stop_check_interval: Option<usize>,
-
-    /// Pick Euler steps from target text length (`adaptive_for_text_len`).
-    #[arg(long, default_value = "false")]
-    adaptive_timesteps: bool,
 }
 
 fn main() -> Result<()> {
@@ -230,9 +226,7 @@ fn build_options(
 }
 
 fn build_generation_config(args: &Args) -> VoxCPMGenerationConfig {
-    let mut config = if args.adaptive_timesteps {
-        VoxCPMGenerationConfig::adaptive_for_text_len(args.text.chars().count())
-    } else if args.ref_wav.is_some() && args.ref_text.is_some() {
+    let mut config = if args.ref_wav.is_some() && args.ref_text.is_some() {
         VoxCPMGenerationConfig::voice_clone()
     } else {
         VoxCPMGenerationConfig::simple()
