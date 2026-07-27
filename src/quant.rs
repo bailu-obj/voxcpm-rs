@@ -120,7 +120,7 @@ impl VoxCPMQuantConfig {
         Self {
             weight,
             skip_patterns: vec![
-                // Separate Q/K/V and gate/up projections (not fused in this codebase).
+                // Separate Q/K/V and gate/up (also blocks fused_linear_x which checks part paths).
                 "self_attn.q_proj".to_string(),
                 "self_attn.k_proj".to_string(),
                 "self_attn.v_proj".to_string(),

@@ -10,8 +10,9 @@ Pure Rust implementation of [VoxCPM](https://huggingface.co/openbmb) text-to-spe
 - **Streaming** — latent-to-audio chunks as `Iterator<Item = Result<Tensor>>`, plus PCM/WAV stream helpers
 - **In-memory output** — `to_wav`, `to_pcm`, and streaming byte iterators without touching disk
 - **GPU backends** — optional Metal (macOS) or CUDA via Candle feature flags
-- **Weight quantization** — live `QMatMul` paths for `q8_0` with quality gates
-- **Benchmarking** — RTF, TTFA, FP-vs-quant correlation checks
+- **Weight quantization** — live `QMatMul` paths for `q8_0` / K-quants with quality gates
+- **Metal dispatch cuts** — fused QKV / gate+up matmuls, fused RoPE, GQA without `repeat_kv` (decode-only fused SDPA)
+- **Benchmarking** — RTF, TTFA, FP-vs-quant / reference-WAV correlation checks
 
 ## Requirements
 
@@ -77,13 +78,20 @@ cargo run --release -p voxcpm-rs --features metal --example vox_cpm_tts_cli -- \
   --compare-fp
 ```
 
-RTF / TTFA benchmark:
+RTF / TTFA benchmark (VoxCPM2 streaming, official full CFG):
 
 ```bash
 cargo run --release -p voxcpm-rs --features metal --example voxcpm2_benchmark -- \
-  --model models/VoxCPM2 \
-  --text "Benchmark sentence." \
-  --stream
+  --model models/VoxCPM2 --stream \
+  --quant q8_0 --dtype f16 --cfg-full-fraction 1.0 \
+  --inference-timesteps 10 \
+  --stream-decode-initial-latent-batch 4 \
+  --stream-decode-latent-batch 8 \
+  --stop-check-interval 4 \
+  --ref-wav models/paimon_01.wav \
+  --ref-text "Reference transcript matching the clip." \
+  --text "好的，我来帮你查一下。请稍等片刻。" \
+  --warmup 1 --runs 3 --profile
 ```
 
 ## Library usage
@@ -147,11 +155,12 @@ In [`bailu.toml`](../../bailu.toml):
 ```toml
 [tts.voxcpm]
 quant = "q8_0"
-dtype = "auto"
+dtype = "f16"
 vae_dtype = "auto"
+cfg_full_fraction = 1.0   # official: CFG on every Euler step
 ```
 
-Override at runtime: `BAILU_VOXCPM_QUANT=none|q8_0|…`. Full operator guide: [`docs/VOXCPM_QUANT.md`](../../docs/VOXCPM_QUANT.md).
+Override at runtime: `BAILU_VOXCPM_QUANT=none|q8_0|…`, `BAILU_VOXCPM_CFG_FULL_FRACTION=…`. Full operator guide: [`docs/VOXCPM_QUANT.md`](../../docs/VOXCPM_QUANT.md).
 
 ### Generation presets (`VoxCPMGenerationConfig`)
 
@@ -162,11 +171,11 @@ Override at runtime: `BAILU_VOXCPM_QUANT=none|q8_0|…`. Full operator guide: [`
 | `low_latency()` | Smaller VAE batches, fewer stop checks |
 | `metal_rtf()` | Metal throughput tuning |
 
-Key fields: `inference_timesteps`, `cfg_value`, `max_len`, `stream_decode_latent_batch`, `stop_check_interval`, `retry_badcase`.
+Key fields: `inference_timesteps` (default **10**), `cfg_value` (**2.0**), `cfg_full_fraction` (**1.0** = official full CFG), `max_len`, `stream_decode_latent_batch`, `stream_decode_initial_latent_batch`, `stop_check_interval`, `retry_badcase`.
 
 ## Weight quantization
 
-Quantization applies at load time to eligible linear layers via Candle `QTensor` + `QMatMul`. Attention uses **separate Q/K/V projections** (not fused QKV) so each matrix quantizes cleanly.
+Quantization applies at load time to eligible linear layers via Candle `QTensor` + `QMatMul`. By default, **Q/K/V and gate/up are fused** into one matmul each (`FusedLinearX`): weights are row-concatenated then quantized once (bit-exact vs separate `q8_0` when `in_features` is block-aligned). Disable with `VOXCPM_FUSE_PROJ=0` (falls back to separate projections; also used automatically when `quality_first` skip patterns hit those modules).
 
 ### Modes
 
@@ -180,16 +189,18 @@ Quantization applies at load time to eligible linear layers via Candle `QTensor`
 
 ### Layer policy
 
-**Quantized:** LM / residual LM / feature encoder / DiT linear layers (MLP + separate Q/K/V/O projections).
+**Quantized:** LM / residual LM / feature encoder / DiT linear layers (fused QKV + gate/up when enabled, plus `o_proj` / `down_proj` and bridge projections).
 
 **Always FP:** `embed_tokens`, `stop_head`, `stop_proj`, `fsq_layer`, **Audio VAE**.
 
 K-quants use block size 256; layers whose input dim is not divisible by 256 may fall back to `q8_0`. Inspect load output:
 
 ```text
-VOXCPM_QUANT_STATS requested=q8_0 quantized=347 skipped=4 fallback_q8=0 mixed_k=false
+VOXCPM_QUANT_STATS requested=q8_0 quantized=252 skipped=4 fallback_q8=0 mixed_k=false
 VOXCPM_QUANT_JSON {...}
 ```
+
+(With fusion disabled, VoxCPM2 reports ~432 quantized matrices; fused QKV/gate+up merges three+two into one each → ~252.)
 
 Programmatic stats: `generator.quant_stats()` after `new_with_options`.
 
@@ -222,14 +233,23 @@ WAV/mel comparison: `scripts/voxcpm_quant_analysis/compare_wav.py --strict --min
 
 ### Reference performance (Metal, release)
 
-VoxCPM-0.5B, `"测试"`, batch — your numbers will vary:
+Numbers vary by machine, text length, and cold vs warm load.
+
+**VoxCPM-0.5B**, `"测试"`, batch (approximate):
 
 | Mode | Load | RTF | FP corr |
 |------|------|-----|---------|
 | `none` | ~0.5s | ~0.62 | — |
 | `q8_0` | ~1.0s | ~0.56 | ~0.998 |
 
-Streaming often improves TTFA for `q8_0` vs FP. Stage split available via `--profile` (`cfm`, `lm`, `vae`, `VOXCPM_BOTTLENECK_HINT`).
+**VoxCPM2** streaming voice-clone (steps **10**, `cfg_full_fraction=1.0`, init/latent/stop **4/8/4**, `q8_0`+`f16`, medium Chinese utterance):
+
+| Build | RTF | TTFA | Notes |
+|-------|----:|-----:|-------|
+| Eager baseline (`VOXCPM_FUSED_SDPA=0`, no proj/RoPE fusion era) | ~1.17 | ~0.94 s | Official full CFG |
+| **Current defaults** (fused proj + RoPE + GQA) | **~0.91** | **~0.79 s** | corr ≥0.999 vs eager cfg-1.0 ref |
+
+Stage split via `--profile` (`cfm`, `lm`, `vae`, `VOXCPM_BOTTLENECK_HINT`). CFM/DiT remains the dominant stage. Operator baseline notes: [`docs/voxcpm2_rtf_baseline.md`](../../docs/voxcpm2_rtf_baseline.md).
 
 ### Benchmarking
 
@@ -245,6 +265,19 @@ VOXCPM_QUANT=q8_0 ./scripts/benchmark_voxcpm_non_stream.sh
 
 Emits `VOXCPM_BENCH_JSON`, `VOXCPM_QUANT_JSON`, and `VOXCPM_BOTTLENECK_HINT`.
 
+## Metal inference optimizations
+
+VoxCPM2 DiT/LM inference is **launch-overhead-bound** on Metal (many tiny kernels per Euler step), not weight-bandwidth-bound. Defaults cut dispatches without changing math:
+
+| Optimization | Where | Escape hatch |
+|--------------|-------|--------------|
+| Fused QKV + gate/up `QMatMul` | `linear.rs` / `common.rs` | `VOXCPM_FUSE_PROJ=0` |
+| Fused RoPE (`candle_nn::rotary_emb::rope`, F32 on F16 acts) | `position_embed/rope.rs` | `VOXCPM_FUSED_ROPE=0` |
+| GQA without `repeat_kv` (unmasked DiT / decode) | `common.rs` | — (masked LM prefill still tiles) |
+| Fused Metal SDPA | `common.rs` `attention_forward` | `VOXCPM_FUSED_SDPA=0` |
+
+**SDPA policy:** default `VOXCPM_FUSED_SDPA_MAX_QLEN=1` (decode / vector kernel only). DiT seq≈11 stays on eager attention — the Metal vector kernel NaNs at `q_seq>1` for this GQA shape, and the tiled full kernel previously corrupted audio (corr≈0.03). Do not raise `MAX_QLEN` for production.
+
 ## Environment variables
 
 | Variable | Effect |
@@ -257,6 +290,11 @@ Emits `VOXCPM_BENCH_JSON`, `VOXCPM_QUANT_JSON`, and `VOXCPM_BOTTLENECK_HINT`.
 | `VOXCPM_BENCH_PROFILE=1` | Capture stage timings for benchmark JSON |
 | `VOXCPM_PROFILE` | Print prefill / inference stage timings |
 | `VOXCPM_PROFILE_STREAM` | Stream chunk timing (inference vs VAE decode) |
+| `VOXCPM_PROFILE_SYNC=1` | Sync GPU around stage timers (inflates wall RTF) |
+| `VOXCPM_FUSE_PROJ=0` | Disable fused QKV / gate+up projections |
+| `VOXCPM_FUSED_ROPE=0` | Disable candle fused RoPE (eager rotate-half) |
+| `VOXCPM_FUSED_SDPA=0` | Force eager attention (disable Metal SDPA) |
+| `VOXCPM_FUSED_SDPA_MAX_QLEN` | Max fused query length (**default 1**; experimental only) |
 
 ## Model layout
 

@@ -47,11 +47,11 @@ impl CausalConv1d {
         // x: [B, C, L]
         // state: [B, C, P*2]
         let state_len = state.dim(D::Minus1)?;
-        let x_pad = if state_len == 0 {
-            x.clone()
-        } else {
-            Tensor::cat(&[state as &Tensor, x], D::Minus1)?
-        };
+        if state_len == 0 {
+            // No padding history — avoid an unconditional clone of x every chunk.
+            return Ok(self.conv1d.forward(x)?);
+        }
+        let x_pad = Tensor::cat(&[state as &Tensor, x], D::Minus1)?;
         let x_out = self.conv1d.forward(&x_pad)?;
         *state = x_pad.narrow(D::Minus1, x.dim(D::Minus1)?, state_len)?;
         Ok(x_out)
@@ -657,21 +657,34 @@ impl CausalDecoder {
         })
     }
 
-    fn sr_cond_tensor(&self, sr_cond: Option<usize>, device: &Device) -> Result<Option<Tensor>> {
+    fn sr_cond_tensor(
+        &self,
+        sr_cond: Option<usize>,
+        device: &Device,
+        cache: &mut Option<(usize, Tensor)>,
+    ) -> Result<Option<Tensor>> {
         let Some(sr_cond) = sr_cond else {
             return Ok(None);
         };
         let Some(boundaries) = &self.sr_bin_boundaries else {
             return Ok(None);
         };
+        if let Some((cached_sr, cached_t)) = cache.as_ref() {
+            if *cached_sr == sr_cond && cached_t.device().location() == device.location() {
+                return Ok(Some(cached_t.clone()));
+            }
+        }
         let sr = bucketize(sr_cond, boundaries)?;
-        Ok(Some(Tensor::new(vec![sr as u32], device)?))
+        let t = Tensor::new(vec![sr as u32], device)?;
+        *cache = Some((sr_cond, t.clone()));
+        Ok(Some(t))
     }
 
     pub fn forward(&self, x: &Tensor, sr_cond: Option<usize>) -> Result<Tensor> {
+        let mut scratch = None;
         let x = self.model0.forward(x)?;
         let mut x = self.model1.forward(&x)?;
-        if let Some(sr_cond_tensor) = self.sr_cond_tensor(sr_cond, x.device())? {
+        if let Some(sr_cond_tensor) = self.sr_cond_tensor(sr_cond, x.device(), &mut scratch)? {
             if let Some(sr_models) = &self.sr_cond_model {
                 for (model_i, sr_model_i) in self.models.iter().zip(sr_models.iter()) {
                     x = sr_model_i.forward(&x, &sr_cond_tensor)?;
@@ -700,7 +713,9 @@ impl CausalDecoder {
     ) -> Result<Tensor> {
         let mut x = self.model0.forward_stream(x, &mut state.model0_state)?;
         x = self.model1.forward_stream(&x, &mut state.model1_state)?;
-        if let Some(sr_cond_tensor) = self.sr_cond_tensor(sr_cond, x.device())? {
+        if let Some(sr_cond_tensor) =
+            self.sr_cond_tensor(sr_cond, x.device(), &mut state.sr_cond_cache)?
+        {
             if let Some(sr_models) = &self.sr_cond_model {
                 for (i, model_i) in self.models.iter().enumerate() {
                     x = sr_models[i].forward(&x, &sr_cond_tensor)?;
@@ -739,6 +754,7 @@ impl CausalDecoder {
             model1_state: self.model1.init_state(batch_size, device, dtype)?,
             block_states,
             model_minus_1_state: self.model_minus_1.init_state(batch_size, device, dtype)?,
+            sr_cond_cache: None,
         })
     }
 }
@@ -748,6 +764,8 @@ pub struct DecoderState {
     pub model1_state: Tensor,
     pub block_states: Vec<DecoderBlockState>,
     pub model_minus_1_state: Tensor,
+    /// Cached sample-rate condition index tensor for streaming (avoids host rebuild per chunk).
+    pub sr_cond_cache: Option<(usize, Tensor)>,
 }
 
 pub type DecoderBlockState = Vec<Vec<Tensor>>; // [block1, block2, block3] states

@@ -33,6 +33,7 @@ struct GenerationParams {
     max_len: usize,
     inference_timesteps: usize,
     cfg_value: f64,
+    cfg_full_fraction: f64,
     stream_decode_latent_batch: usize,
     stream_decode_initial_latent_batch: usize,
     stop_check_interval: usize,
@@ -45,10 +46,25 @@ impl GenerationParams {
             max_len: config.effective_max_len(target_text_len),
             inference_timesteps: config.inference_timesteps.max(1),
             cfg_value: config.cfg_value,
+            cfg_full_fraction: config.cfg_full_fraction.clamp(0.0, 1.0),
             stream_decode_latent_batch: config.stream_decode_latent_batch(),
             stream_decode_initial_latent_batch: config.stream_decode_initial_latent_batch(),
             stop_check_interval: config.stop_check_interval.max(1),
         }
+    }
+}
+
+/// Synchronize the device for trustworthy stage splits.
+///
+/// Opt-in via `VOXCPM_PROFILE_SYNC=1` — syncing on every stage would inflate wall/RTF when
+/// `--profile` is enabled (the default for the benchmark CLI).
+fn profile_sync(device: &Device) {
+    if stage_capture_enabled()
+        && std::env::var("VOXCPM_PROFILE_SYNC")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false)
+    {
+        let _ = device.synchronize();
     }
 }
 
@@ -290,48 +306,71 @@ impl VoxCPMLocDiT {
         dt: Option<&Tensor>,
         cond_is_projected: bool,
     ) -> Result<Tensor> {
+        self.forward_with_t_emb_inner(x, mu, t, cond, dt, cond_is_projected, false)
+    }
+
+    /// Like [`Self::forward_with_t_emb`], but when `t_includes_dt` is true the caller already
+    /// folded delta-time into `t` (see `UnifiedCFM::ensure_solver_cache`).
+    pub fn forward_with_t_emb_inner(
+        &mut self,
+        x: &Tensor,
+        mu: &Tensor,
+        t: &Tensor,
+        cond: &Tensor,
+        dt: Option<&Tensor>,
+        cond_is_projected: bool,
+        t_includes_dt: bool,
+    ) -> Result<Tensor> {
         let x = self.in_proj.forward(x)?;
+        // Avoid cloning projected cond every Euler step — it is fixed for a whole solve.
+        let cond_owned;
         let cond = if cond_is_projected {
-            cond.to_owned()
+            cond
         } else {
-            self.cond_proj.forward(cond)?
+            cond_owned = self.cond_proj.forward(cond)?;
+            &cond_owned
         };
         let prefix = cond.dim(1)?;
         let dtype = x.dtype();
-        let dt_emb = match dt {
-            None => {
-                // dt is all-zeros: result is constant — compute once and reuse.
-                let b = t.dim(0)?;
-                let need_new = self.zero_dt_emb_cache.as_ref().map_or(
-                    true,
-                    |(cached_b, cached_dtype, cached)| {
-                        *cached_b != b
-                            || *cached_dtype != dtype
-                            || cached.device().location() != t.device().location()
-                    },
-                );
-                if need_new {
-                    let zero_dt = Tensor::zeros(b, dtype, t.device())?;
-                    let emb = self
-                        .time_embeddings
-                        .forward(&zero_dt, 1000)?
-                        .to_dtype(dtype)?;
-                    self.zero_dt_emb_cache = Some((b, dtype, self.delta_time_mlp.forward(&emb)?));
+        let t_total = if t_includes_dt {
+            t.clone()
+        } else {
+            let dt_emb = match dt {
+                None => {
+                    // dt is all-zeros: result is constant — compute once and reuse.
+                    let b = t.dim(0)?;
+                    let need_new = self.zero_dt_emb_cache.as_ref().map_or(
+                        true,
+                        |(cached_b, cached_dtype, cached)| {
+                            *cached_b != b
+                                || *cached_dtype != dtype
+                                || cached.device().location() != t.device().location()
+                        },
+                    );
+                    if need_new {
+                        let zero_dt = Tensor::zeros(b, dtype, t.device())?;
+                        let emb = self
+                            .time_embeddings
+                            .forward(&zero_dt, 1000)?
+                            .to_dtype(dtype)?;
+                        self.zero_dt_emb_cache =
+                            Some((b, dtype, self.delta_time_mlp.forward(&emb)?));
+                    }
+                    self.zero_dt_emb_cache.as_ref().unwrap().2.clone()
                 }
-                self.zero_dt_emb_cache.as_ref().unwrap().2.clone()
-            }
-            Some(dt) => {
-                let emb = self.time_embeddings.forward(dt, 1000)?.to_dtype(dtype)?;
-                self.delta_time_mlp.forward(&emb)?
-            }
+                Some(dt) => {
+                    let emb = self.time_embeddings.forward(dt, 1000)?.to_dtype(dtype)?;
+                    self.delta_time_mlp.forward(&emb)?
+                }
+            };
+            t.add(&dt_emb)?
         };
-        let t_total = t.add(&dt_emb)?;
 
         let hidden_dim = x.dim(D::Minus1)?;
         let mu_width = mu.dim(D::Minus1)?;
         let (x, prefix_tokens) = if mu_width == hidden_dim {
             (
-                Tensor::cat(&[mu.add(&t_total)?.unsqueeze(1)?, cond, x], 1)?,
+                Tensor::cat(&[mu.add(&t_total)?.unsqueeze(1)?, cond.clone(), x], 1)?,
                 1,
             )
         } else {
@@ -339,7 +378,7 @@ impl VoxCPMLocDiT {
             let mu_tokens = mu.reshape((b, (), hidden_dim))?;
             let prefix_tokens = mu_tokens.dim(1)? + 1;
             (
-                Tensor::cat(&[&mu_tokens, &t_total.unsqueeze(1)?, &cond, &x], 1)?,
+                Tensor::cat(&[&mu_tokens, &t_total.unsqueeze(1)?, cond, &x], 1)?,
                 prefix_tokens,
             )
         };
@@ -350,6 +389,26 @@ impl VoxCPMLocDiT {
         let hidden = self.out_proj.forward(&hidden)?;
         Ok(hidden)
     }
+
+    fn zero_dt_emb_for_batch(&mut self, batch: usize, dtype: DType, device: &Device) -> Result<Tensor> {
+        let need_new = self.zero_dt_emb_cache.as_ref().map_or(
+            true,
+            |(cached_b, cached_dtype, cached)| {
+                *cached_b != batch
+                    || *cached_dtype != dtype
+                    || cached.device().location() != device.location()
+            },
+        );
+        if need_new {
+            let zero_dt = Tensor::zeros(batch, dtype, device)?;
+            let emb = self
+                .time_embeddings
+                .forward(&zero_dt, 1000)?
+                .to_dtype(dtype)?;
+            self.zero_dt_emb_cache = Some((batch, dtype, self.delta_time_mlp.forward(&emb)?));
+        }
+        Ok(self.zero_dt_emb_cache.as_ref().unwrap().2.clone())
+    }
 }
 
 pub struct UnifiedCFM {
@@ -357,11 +416,14 @@ pub struct UnifiedCFM {
     mean_mode: bool,
     estimator: VoxCPMLocDiT,
     t_span_cache: Option<(usize, f64, Tensor)>,
-    solver_cache: Option<(usize, f64, usize, DType, Vec<Tensor>, Vec<Tensor>)>,
+    /// (n_timesteps, sway, batch, dtype, t_emb_or_totals, dt_steps, t_includes_dt)
+    solver_cache: Option<(usize, f64, usize, DType, Vec<Tensor>, Vec<Tensor>, bool)>,
     /// `Tensor::ones(1, …)` reused across Euler steps when CFG scale is not identity.
     euler_cfg_ones: Option<(DType, Tensor)>,
     /// `Tensor::zeros_like(mu)` for the negative CFG branch when `mean_mode` is false.
     mu_zeros_cache: Option<(Vec<usize>, DType, Tensor)>,
+    /// Cached zeros matching `x` dims for CFG zero-init steps.
+    euler_x_zeros_cache: Option<(Vec<usize>, DType, Tensor)>,
 }
 
 impl UnifiedCFM {
@@ -379,6 +441,7 @@ impl UnifiedCFM {
             solver_cache: None,
             euler_cfg_ones: None,
             mu_zeros_cache: None,
+            euler_x_zeros_cache: None,
         })
     }
 
@@ -392,6 +455,7 @@ impl UnifiedCFM {
         cfg_value: f64,
         sway_sampling_coef: f64,
         use_cfg_zero_star: bool,
+        cfg_full_fraction: f64,
     ) -> Result<Tensor> {
         let (b, _) = mu.dims2()?;
         let t = patch_size;
@@ -419,12 +483,23 @@ impl UnifiedCFM {
         };
 
         self.ensure_solver_cache(&t_span, n_timesteps, sway_sampling_coef, 2 * b, dtype)?;
-        let x = self.solve_euler(&z, &t_span, mu, cond, cfg_value, use_cfg_zero_star)?;
+        let x = self.solve_euler(
+            &z,
+            &t_span,
+            mu,
+            cond,
+            cfg_value,
+            use_cfg_zero_star,
+            cfg_full_fraction,
+        )?;
         Ok(x)
     }
 
     /// Fills `solver_cache` Euler timestep embeddings and `dt` tensors without cloning them per
     /// `forward` call (see `solve_euler`).
+    ///
+    /// When `mean_mode=false`, folds the constant zero delta-time embedding into each `t_emb`
+    /// so `solve_euler` can skip the per-step `t.add(dt_emb)`.
     fn ensure_solver_cache(
         &mut self,
         t_span: &Tensor,
@@ -434,7 +509,7 @@ impl UnifiedCFM {
         dtype: DType,
     ) -> Result<()> {
         let need_new = self.solver_cache.as_ref().map_or(true, |cache| {
-            let (cached_n, cached_sway, cached_b, cached_dtype, cached_embs, cached_dts) = cache;
+            let (cached_n, cached_sway, cached_b, cached_dtype, cached_embs, cached_dts, _) = cache;
             *cached_n != n_timesteps
                 || *cached_sway != sway_sampling_coef
                 || *cached_b != batch_size
@@ -450,9 +525,23 @@ impl UnifiedCFM {
         if need_new {
             let mut embeddings = Vec::with_capacity(n_timesteps);
             let mut dt_steps = Vec::with_capacity(n_timesteps);
+            let fold_dt = !self.mean_mode;
+            let zero_dt = if fold_dt {
+                Some(self.estimator.zero_dt_emb_for_batch(
+                    batch_size,
+                    dtype,
+                    t_span.device(),
+                )?)
+            } else {
+                None
+            };
             for idx in 0..n_timesteps {
                 let t_in = t_span.i(idx)?.broadcast_as(batch_size)?;
-                embeddings.push(self.estimator.timestep_embedding(&t_in, dtype)?);
+                let mut emb = self.estimator.timestep_embedding(&t_in, dtype)?;
+                if let Some(dt_emb) = &zero_dt {
+                    emb = emb.add(dt_emb)?;
+                }
+                embeddings.push(emb);
                 dt_steps.push(t_span.i(idx)?.sub(&t_span.i(idx + 1)?)?);
             }
             self.solver_cache = Some((
@@ -462,6 +551,7 @@ impl UnifiedCFM {
                 dtype,
                 embeddings,
                 dt_steps,
+                fold_dt,
             ));
         }
         Ok(())
@@ -504,9 +594,11 @@ impl UnifiedCFM {
         cond: &Tensor,
         cfg_value: f64,
         use_cfg_zero_star: bool,
+        cfg_full_fraction: f64,
     ) -> Result<Tensor> {
-        let (t_embs, dt_steps) = match &self.solver_cache {
-            Some((_, _, _, _, emb, dt)) => (emb.clone(), dt.clone()),
+        // Tensor clone is Arc-shallow; avoid holding an immutable borrow across &mut self.estimator.
+        let (t_embs, dt_steps, t_includes_dt) = match &self.solver_cache {
+            Some((_, _, _, _, emb, dt, folded)) => (emb.clone(), dt.clone(), *folded),
             None => {
                 anyhow::bail!("solve_euler: solver cache missing; call ensure_solver_cache first")
             }
@@ -546,48 +638,60 @@ impl UnifiedCFM {
         let b2 = 2 * b;
 
         let n_euler_steps = t_span_len - 1;
-        // CFG matters most in early denoising; skip the 2× batch on the second half.
-        let cfg_full_steps = (n_euler_steps as f64 * 0.5).ceil() as usize;
+        // CFG matters most in early denoising; skip the 2× batch on the late fraction.
+        let cfg_full_steps = (n_euler_steps as f64 * cfg_full_fraction).ceil() as usize;
 
         for step in 1..t_span_len {
             let dt = &dt_steps[step - 1];
             let next_dphi_dt = {
                 if use_cfg_zero_star && step <= zero_init_steps {
-                    Tensor::zeros(x.dims(), x.dtype(), x.device())?
+                    let x_dims = x.dims().to_vec();
+                    match &self.euler_x_zeros_cache {
+                        Some((cached_dims, cached_dtype, cached_t))
+                            if cached_dims == &x_dims
+                                && *cached_dtype == dtype
+                                && cached_t.device().location() == device.location() =>
+                        {
+                            cached_t.clone()
+                        }
+                        _ => {
+                            let z = Tensor::zeros(x.dims(), dtype, &device)?;
+                            self.euler_x_zeros_cache = Some((x_dims, dtype, z.clone()));
+                            z
+                        }
+                    }
                 } else if cfg_value != 1.0 && step <= cfg_full_steps {
-                    let x_in = Tensor::cat(&[&x, &x], 0)?;
-                    // When mean_mode=false, dt_in is always zeros; pass None so the
-                    // estimator can use its cached zero-dt embedding instead of
-                    // recomputing SinusoidalPosEmb + delta_time_mlp every Euler step.
+                    // repeat is equivalent to cat([&x,&x]) and keeps a single allocation path.
+                    let x_in = x.repeat((2, 1, 1))?;
+                    // When mean_mode=false, dt is folded into t_embs; pass None + t_includes_dt.
                     let dt_opt = if self.mean_mode {
                         Some(dt.broadcast_as(b2)?)
                     } else {
                         None
                     };
-                    let dphi_dt_combined = self.estimator.forward_with_t_emb(
+                    let dphi_dt_combined = self.estimator.forward_with_t_emb_inner(
                         &x_in,
                         &mu_in,
                         &t_embs[step - 1],
                         &cond_in,
                         dt_opt.as_ref(),
                         true,
+                        t_includes_dt,
                     )?;
                     let split = dphi_dt_combined.chunk(2, 0)?;
                     let dphi_dt_pos = &split[0];
                     let cfg_dphi_dt = &split[1];
 
-                    if use_cfg_zero_star {
-                        // Compute st_star: ones when cfg_zero_star is off, adaptive scale when on.
+                    // Folded CFG: cfg_value * pos + (1 - cfg_value) * (st_star * neg)
+                    let st_star = if use_cfg_zero_star {
                         let positive_flat = dphi_dt_pos.reshape((b, ()))?;
                         let negative_flat = cfg_dphi_dt.reshape((b, ()))?;
                         let scale = self.optimized_scale(&positive_flat, &negative_flat)?;
                         let mut vec_shape = vec![b];
                         vec_shape.extend(vec![1; dphi_dt_pos.rank() - 1]);
-                        let st_star = scale.reshape(vec_shape)?;
-                        let cfg = cfg_dphi_dt.broadcast_mul(&st_star)?;
-                        cfg.add(&dphi_dt_pos.sub(&cfg)?.affine(cfg_value, 0.0)?)?
+                        scale.reshape(vec_shape)?
                     } else {
-                        let st_star = match &self.euler_cfg_ones {
+                        match &self.euler_cfg_ones {
                             Some((cached_dtype, cached_t))
                                 if *cached_dtype == dtype
                                     && cached_t.device().location() == device.location() =>
@@ -599,10 +703,12 @@ impl UnifiedCFM {
                                 self.euler_cfg_ones = Some((dtype, one.clone()));
                                 one
                             }
-                        };
-                        let cfg = cfg_dphi_dt.broadcast_mul(&st_star)?;
-                        cfg.add(&dphi_dt_pos.sub(&cfg)?.affine(cfg_value, 0.0)?)?
-                    }
+                        }
+                    };
+                    let neg_scaled = cfg_dphi_dt.broadcast_mul(&st_star)?;
+                    dphi_dt_pos
+                        .affine(cfg_value, 0.0)?
+                        .add(&neg_scaled.affine(1.0 - cfg_value, 0.0)?)?
                 } else {
                     // Positive-only branch: halve DiT cost on late Euler steps.
                     let dt_opt = if self.mean_mode {
@@ -611,17 +717,18 @@ impl UnifiedCFM {
                         None
                     };
                     let t_emb_b = t_embs[step - 1].narrow(0, 0, b)?;
-                    self.estimator.forward_with_t_emb(
+                    self.estimator.forward_with_t_emb_inner(
                         &x,
                         mu,
                         &t_emb_b,
                         &cond_proj,
                         dt_opt.as_ref(),
                         true,
+                        t_includes_dt,
                     )?
                 }
             };
-            x = x.broadcast_sub(&next_dphi_dt.broadcast_mul(&dt)?)?;
+            x = x.broadcast_sub(&next_dphi_dt.broadcast_mul(dt)?)?;
         }
         Ok(x)
     }
@@ -1505,6 +1612,9 @@ impl<'a> Iterator for VoxCPMInferenceStream<'a> {
             Err(e) => return Some(Err(e.into())),
         };
 
+        if self.step_profile.is_some() {
+            profile_sync(self.model.device());
+        }
         let cfm_start = self.step_profile.as_ref().map(|_| Instant::now());
         let pred_feat = match self.model.feat_decoder.forward(
             &dit_hidden,
@@ -1515,11 +1625,13 @@ impl<'a> Iterator for VoxCPMInferenceStream<'a> {
             self.params.cfg_value,
             1.0,
             true,
+            self.params.cfg_full_fraction,
         ) {
             Ok(t) => t,
             Err(e) => return Some(Err(e.into())),
         };
         if let (Some(profile), Some(start)) = (&mut self.step_profile, cfm_start) {
+            profile_sync(self.model.device());
             profile.record_cfm(start.elapsed());
         }
 
@@ -1531,6 +1643,9 @@ impl<'a> Iterator for VoxCPMInferenceStream<'a> {
         let should_check_stop = self.i > self.params.min_len
             && (self.i % self.params.stop_check_interval == 0 || self.i + 1 >= self.params.max_len);
         if should_check_stop {
+            if self.step_profile.is_some() {
+                profile_sync(self.model.device());
+            }
             let stop_start = self.step_profile.as_ref().map(|_| Instant::now());
             let stop_flag = match self.model.stop_proj.forward(&self.lm_hidden) {
                 Ok(t) => match t.silu().and_then(|t| self.model.stop_head.forward(&t)) {
@@ -1546,6 +1661,7 @@ impl<'a> Iterator for VoxCPMInferenceStream<'a> {
                 Err(e) => return Some(Err(e.into())),
             };
             if let (Some(profile), Some(start)) = (&mut self.step_profile, stop_start) {
+                profile_sync(self.model.device());
                 profile.stop += start.elapsed();
             }
 
@@ -1560,6 +1676,9 @@ impl<'a> Iterator for VoxCPMInferenceStream<'a> {
         // Skip LM decode when already finished: the next lm_hidden / residual_hidden
         // would never be consumed, so computing the feature encoder is pure waste too.
         if !self.finished {
+            if self.step_profile.is_some() {
+                profile_sync(self.model.device());
+            }
             let lm_start = self.step_profile.as_ref().map(|_| Instant::now());
             let pred_feat_unsqueezed = match self.prefix_feat_cond.unsqueeze(1) {
                 Ok(t) => t,
@@ -1627,6 +1746,7 @@ impl<'a> Iterator for VoxCPMInferenceStream<'a> {
                 }
             };
             if let (Some(profile), Some(start)) = (&mut self.step_profile, lm_start) {
+                profile_sync(self.model.device());
                 profile.lm_advance += start.elapsed();
             }
         }
@@ -1754,6 +1874,9 @@ impl<'a> VoxCPMGenerateStream<'a> {
             Err(e) => return Some(Err(anyhow::Error::from(e))),
         };
 
+        if self.profile_enabled || stage_capture_enabled() {
+            profile_sync(self.inf_stream.model.device());
+        }
         let vae_start = self.profile_enabled.then(Instant::now);
         let audio_chunk = match self.inf_stream.model.audio_vae.decode_stream(
             &latent_vae,
@@ -1767,8 +1890,11 @@ impl<'a> VoxCPMGenerateStream<'a> {
             Err(e) => return Some(Err(anyhow::Error::from(e))),
         };
         if let Some(start) = vae_start {
-            self.profile_vae_time += start.elapsed();
+            profile_sync(self.inf_stream.model.device());
+            let d = start.elapsed();
+            self.profile_vae_time += d;
             self.profile_chunks += latents.len();
+            StageProfile::add_vae_decode(d);
         }
         self.initial_decode_done = true;
 
@@ -1791,9 +1917,13 @@ impl<'a> Iterator for VoxCPMGenerateStream<'a> {
         }
 
         loop {
-            let inf_start = self.profile_enabled.then(Instant::now);
+            let inf_start = self.profile_enabled.then(|| {
+                profile_sync(self.inf_stream.model.device());
+                Instant::now()
+            });
             let next_latent = self.inf_stream.next();
             if let Some(start) = inf_start {
+                profile_sync(self.inf_stream.model.device());
                 self.profile_inf_time += start.elapsed();
             }
 
@@ -1803,18 +1933,17 @@ impl<'a> Iterator for VoxCPMGenerateStream<'a> {
 
             match next_latent {
                 Ok(latent) => {
-                    // latent: [B, D, P]
                     let (b, _, _) = match latent.dims3() {
                         Ok(dims) => dims,
                         Err(e) => return Some(Err(anyhow::Error::from(e))),
                     };
 
                     if self.vae_state.is_none() {
-                        // Streaming decoder state stays F32 on Metal (see `get_vae_compute_dtype`).
+                        let dtype = self.inf_stream.model.audio_vae.compute_dtype();
                         let state = match self.inf_stream.model.audio_vae.init_decoder_state(
                             b,
                             &latent.device(),
-                            DType::F32,
+                            dtype,
                         ) {
                             Ok(s) => s,
                             Err(e) => return Some(Err(anyhow::Error::from(e))),
@@ -1828,9 +1957,16 @@ impl<'a> Iterator for VoxCPMGenerateStream<'a> {
                             Ok(audio_chunk) => {
                                 match self.prepare_stream_chunk(audio_chunk, false) {
                                     Ok(Some(trimmed)) => {
-                                        if let Some(to_yield) = self.pending_chunk.replace(trimmed)
+                                        if let Some(to_yield) =
+                                            self.pending_chunk.replace(trimmed)
                                         {
                                             return Some(Ok(to_yield));
+                                        }
+                                        // First decoded chunk: yield immediately so TTFA
+                                        // tracks `stream_decode_initial_latent_batch` rather
+                                        // than waiting an extra steady-state VAE batch.
+                                        if let Some(first) = self.pending_chunk.take() {
+                                            return Some(Ok(first));
                                         }
                                     }
                                     Ok(None) => {}

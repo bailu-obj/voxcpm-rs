@@ -43,10 +43,14 @@ pub struct VoxCPMGenerationConfig {
     pub max_len: usize,
     pub inference_timesteps: usize,
     pub cfg_value: f64,
+    /// Fraction of Euler steps that run the 2× CFG batch (rest are positive-only).
+    /// Default `1.0` matches official OpenBMB VoxCPM2 (CFG on every denoising step).
+    pub cfg_full_fraction: f64,
     pub retry_badcase: bool,
     pub retry_badcase_ratio_threshold: f64,
     pub stream_decode_latent_batch: usize,
     /// First streaming VAE decode waits for this many latents (0 = auto: max(16, 2× batch)).
+    /// May be smaller than `stream_decode_latent_batch` for lower TTFA.
     pub stream_decode_initial_latent_batch: usize,
     /// Run stop-head every N latents after `min_len` (1 = every step).
     pub stop_check_interval: usize,
@@ -65,6 +69,7 @@ impl VoxCPMGenerationConfig {
             max_len: 100,
             inference_timesteps: DEFAULT_INFERENCE_TIMESTEPS,
             cfg_value: 2.0,
+            cfg_full_fraction: 1.0,
             retry_badcase: true,
             retry_badcase_ratio_threshold: 6.0,
             stream_decode_latent_batch: DEFAULT_STREAM_DECODE_LATENT_BATCH,
@@ -79,6 +84,7 @@ impl VoxCPMGenerationConfig {
             max_len: 500,
             inference_timesteps: DEFAULT_INFERENCE_TIMESTEPS,
             cfg_value: 2.0,
+            cfg_full_fraction: 1.0,
             retry_badcase: true,
             retry_badcase_ratio_threshold: 3.0,
             stream_decode_latent_batch: DEFAULT_STREAM_DECODE_LATENT_BATCH,
@@ -94,6 +100,7 @@ impl VoxCPMGenerationConfig {
             max_len: 500,
             inference_timesteps: 8,
             cfg_value: 2.0,
+            cfg_full_fraction: 1.0,
             retry_badcase: true,
             retry_badcase_ratio_threshold: 3.0,
             stream_decode_latent_batch: 2,
@@ -109,6 +116,7 @@ impl VoxCPMGenerationConfig {
             max_len: 500,
             inference_timesteps: 8,
             cfg_value: 2.0,
+            cfg_full_fraction: 1.0,
             retry_badcase: true,
             retry_badcase_ratio_threshold: 3.0,
             stream_decode_latent_batch: 8,
@@ -133,7 +141,8 @@ impl VoxCPMGenerationConfig {
     pub(crate) fn stream_decode_initial_latent_batch(self) -> usize {
         let batch = self.stream_decode_latent_batch();
         if self.stream_decode_initial_latent_batch > 0 {
-            self.stream_decode_initial_latent_batch.max(batch)
+            // Allow initial < steady-state batch so TTFA and RTF can be tuned independently.
+            self.stream_decode_initial_latent_batch.max(1)
         } else {
             batch.saturating_mul(2).max(16)
         }

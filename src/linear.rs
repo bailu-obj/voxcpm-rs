@@ -265,6 +265,94 @@ pub fn linear_x_from_parts(
     linear_x_from_linear(Linear::new(weight, bias), ctx, device)
 }
 
+/// Whether fused QKV / gate+up projections are disabled (`VOXCPM_FUSE_PROJ=0`).
+#[must_use]
+pub fn fuse_proj_env_disabled() -> bool {
+    match std::env::var("VOXCPM_FUSE_PROJ") {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            v == "0" || v == "false" || v == "off"
+        }
+        Err(_) => false,
+    }
+}
+
+/// One quantized matmul over row-concatenated weights, plus the per-part out dims.
+///
+/// Concatenating along `out_features` (dim 0) leaves each row's GGUF blocks byte-identical
+/// to separate quantization, so this is bit-exact vs unfused `LinearX` layers when
+/// `in_features` is block-aligned (true for all VoxCPM2 shapes).
+#[derive(Debug, Clone)]
+pub struct FusedLinearX {
+    inner: LinearX,
+    parts: Vec<usize>,
+}
+
+impl FusedLinearX {
+    #[must_use]
+    pub fn parts(&self) -> &[usize] {
+        &self.parts
+    }
+
+    /// Forward then split along the last dim into `parts.len()` tensors.
+    pub fn forward_split(&self, xs: &Tensor) -> candle_core::Result<Vec<Tensor>> {
+        let out = self.inner.forward(xs)?;
+        let mut splits = Vec::with_capacity(self.parts.len());
+        let mut offset = 0usize;
+        for &width in &self.parts {
+            splits.push(out.narrow(candle_core::D::Minus1, offset, width)?);
+            offset += width;
+        }
+        Ok(splits)
+    }
+
+    pub fn forward(&self, xs: &Tensor) -> candle_core::Result<Tensor> {
+        self.inner.forward(xs)
+    }
+}
+
+/// Build a fused linear from named weight slices under `vb`.
+///
+/// `parts` is e.g. `[("q_proj", 2048), ("k_proj", 256), ("v_proj", 256)]`.
+/// Each part is loaded from `vb.pp(name)` as a no-bias linear; weights are
+/// concatenated along dim 0 before optional quantization via `ctx`.
+///
+/// Returns `None` when fusion is disabled via env or when any part path is
+/// skipped by `ctx` (caller should fall back to separate linears).
+pub fn fused_linear_x(
+    in_dim: usize,
+    parts: &[(&str, usize)],
+    vb: VarBuilder,
+    ctx: &QuantBuildCtx,
+) -> Result<Option<FusedLinearX>> {
+    if fuse_proj_env_disabled() || parts.is_empty() {
+        return Ok(None);
+    }
+    // If any constituent path is skipped (e.g. quality_first), keep unfused.
+    for &(name, _) in parts {
+        let part_ctx = ctx.pp(name);
+        if part_ctx.config.should_skip_module(&part_ctx.module_path) {
+            return Ok(None);
+        }
+    }
+
+    let device = vb.device().clone();
+    let mut weights = Vec::with_capacity(parts.len());
+    let mut widths = Vec::with_capacity(parts.len());
+    for &(name, out_dim) in parts {
+        let ln = linear_no_bias(in_dim, out_dim, vb.pp(name))?;
+        weights.push(ln.weight().clone());
+        widths.push(out_dim);
+    }
+    let fused_weight = Tensor::cat(&weights, 0)?;
+    // Quantize under the parent ctx path (one decision / one QMatMul).
+    let inner = linear_x_from_parts(fused_weight, None, ctx, &device)?;
+    Ok(Some(FusedLinearX {
+        inner,
+        parts: widths,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,6 +454,38 @@ mod tests {
         qlinear_parity_for_quant(VoxCPMWeightQuant::Q4K)?;
         qlinear_parity_for_quant(VoxCPMWeightQuant::Q5K)?;
         qlinear_parity_for_quant(VoxCPMWeightQuant::Q6K)?;
+        Ok(())
+    }
+
+    #[test]
+    fn fused_q8_matches_separate_cpu() -> Result<()> {
+        let device = Device::Cpu;
+        let w_q = Tensor::randn(0f32, 0.02f32, (64, 32), &device)?;
+        let w_k = Tensor::randn(0f32, 0.02f32, (32, 32), &device)?;
+        let w_v = Tensor::randn(0f32, 0.02f32, (32, 32), &device)?;
+        let x = Tensor::randn(0f32, 1f32, (1, 4, 32), &device)?;
+
+        let ctx =
+            QuantBuildCtx::root(VoxCPMQuantConfig::with_weight(VoxCPMWeightQuant::Q8_0)).pp("attn");
+        let fused_w = Tensor::cat(&[&w_q, &w_k, &w_v], 0)?;
+        let fused = FusedLinearX {
+            inner: linear_x_from_parts(fused_w, None, &ctx, &device)?,
+            parts: vec![64, 32, 32],
+        };
+        let parts = fused.forward_split(&x)?;
+
+        let ctx2 =
+            QuantBuildCtx::root(VoxCPMQuantConfig::with_weight(VoxCPMWeightQuant::Q8_0)).pp("attn");
+        let q = linear_x_from_parts(w_q, None, &ctx2.pp("q_proj"), &device)?;
+        let k = linear_x_from_parts(w_k, None, &ctx2.pp("k_proj"), &device)?;
+        let v = linear_x_from_parts(w_v, None, &ctx2.pp("v_proj"), &device)?;
+        let y_q = q.forward(&x)?;
+        let y_k = k.forward(&x)?;
+        let y_v = v.forward(&x)?;
+
+        assert!(rmse(&parts[0], &y_q)? < 1e-5, "q mismatch");
+        assert!(rmse(&parts[1], &y_k)? < 1e-5, "k mismatch");
+        assert!(rmse(&parts[2], &y_v)? < 1e-5, "v mismatch");
         Ok(())
     }
 }

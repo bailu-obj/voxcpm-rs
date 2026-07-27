@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Ok, Result};
-use candle_core::{DType, Device, Tensor, D};
+use candle_core::{DType, Device, Tensor};
 use candle_nn::{embedding, rms_norm, Embedding, Module, RmsNorm, VarBuilder};
 
 use crate::{
@@ -47,9 +47,9 @@ impl MiniCPMLongRoPE {
         // (seq_len, 1) matmul (1, 32) -> (seq_len, 32) * (1, 32)-> (seq_len, 32)
         let freqs = t.matmul(&ext_factors)?.broadcast_mul(&inv_freq)?;
 
-        let emb = Tensor::cat(&[&freqs, &freqs], D::Minus1)?;
-        let cos_cached = emb.cos()?.affine(scaling_factor, 0.0)?.to_dtype(dtype)?;
-        let sin_cached = emb.sin()?.affine(scaling_factor, 0.0)?.to_dtype(dtype)?;
+        // Cache half-width (head_dim/2) for candle fused RoPE; eager path expands via cat.
+        let cos_cached = freqs.cos()?.affine(scaling_factor, 0.0)?.to_dtype(dtype)?;
+        let sin_cached = freqs.sin()?.affine(scaling_factor, 0.0)?.to_dtype(dtype)?;
         Ok(Self {
             short_factor,
             long_factor,
@@ -81,12 +81,11 @@ impl MiniCPMLongRoPE {
             .inv_freq
             .broadcast_mul(&Tensor::ones_like(&ext_factors)?.div(&ext_factors)?)?;
         let freqs = t.matmul(&inv_freq)?;
-        let emb = Tensor::cat(&[&freqs, &freqs], D::Minus1)?;
-        self.cos_cached = emb
+        self.cos_cached = freqs
             .cos()?
             .affine(self.scaling_factor, 0.0)?
             .to_dtype(self.dtype)?;
-        self.sin_cached = emb
+        self.sin_cached = freqs
             .sin()?
             .affine(self.scaling_factor, 0.0)?
             .to_dtype(self.dtype)?;
