@@ -18,7 +18,9 @@ pub mod utils;
 
 pub use config::{AudioVaeConfig, VoxCPMConfig};
 pub use generate::{
-    VoxCPMGenerationConfig, VoxCPMGenerator, VoxCPMGeneratorOptions, COMPARE_FP_DEFAULT_SEED,
+    VoxCPMGenerationConfig, VoxCPMGenerationDiagnostics, VoxCPMGenerator, VoxCPMGeneratorOptions,
+    VoxCPMStopReason, COMPARE_FP_DEFAULT_SEED, DEFAULT_STREAM_DECODE_INITIAL_LATENT_BATCH,
+    DEFAULT_STREAM_DECODE_LATENT_BATCH,
 };
 pub use profile::{
     audio_quality_ok, bench_profile_enabled, bottleneck_hint, compare_fp_enabled,

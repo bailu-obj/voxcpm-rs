@@ -172,14 +172,8 @@ mod tests {
 
         let eager = rope_single(&x, &cos_full, &sin_full)?;
         let fused = candle_nn::rotary_emb::rope(&x, &cos_half, &sin_half)?;
-        let diff = (&eager - &fused)?
-            .abs()?
-            .max_all()?
-            .to_scalar::<f32>()?;
-        assert!(
-            diff < 1e-5,
-            "candle rope vs rope_single max_diff={diff}"
-        );
+        let diff = (&eager - &fused)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        assert!(diff < 1e-5, "candle rope vs rope_single max_diff={diff}");
         Ok(())
     }
 }

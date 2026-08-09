@@ -16,7 +16,41 @@ use crate::{
 
 const DEFAULT_INFERENCE_TIMESTEPS: usize = 10;
 pub const DEFAULT_STREAM_DECODE_LATENT_BATCH: usize = 8;
-const DEFAULT_STOP_CHECK_INTERVAL: usize = 4;
+/// Bailu/OpenBMB quality default: first streaming VAE decode batch (TTFA).
+pub const DEFAULT_STREAM_DECODE_INITIAL_LATENT_BATCH: usize = 4;
+/// Quality default: check stop head every latent (matches OpenBMB VoxCPM2).
+const DEFAULT_STOP_CHECK_INTERVAL: usize = 1;
+const DEFAULT_MIN_LEN: usize = 2;
+const DEFAULT_MAX_LEN: usize = 500;
+const DEFAULT_RETRY_BADCASE_RATIO: f64 = 6.0;
+
+/// Why latent generation ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VoxCPMStopReason {
+    /// Learned stop head predicted end-of-speech.
+    StopHead,
+    /// Hit `effective_max_len` without a stop-head trigger.
+    MaxLen,
+}
+
+impl VoxCPMStopReason {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::StopHead => "stop_head",
+            Self::MaxLen => "max_len",
+        }
+    }
+}
+
+/// Diagnostics from the most recent generation on a [`VoxCPMGenerator`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VoxCPMGenerationDiagnostics {
+    pub stop_reason: VoxCPMStopReason,
+    pub latent_count: usize,
+    pub target_text_tokens: usize,
+    pub effective_max_len: usize,
+}
 
 /// Runtime options for model load (device, dtype, quantization).
 #[derive(Debug, Clone, Default)]
@@ -65,30 +99,34 @@ impl Default for VoxCPMGenerationConfig {
 impl VoxCPMGenerationConfig {
     pub fn simple() -> Self {
         Self {
-            min_len: 2,
+            min_len: DEFAULT_MIN_LEN,
             max_len: 100,
             inference_timesteps: DEFAULT_INFERENCE_TIMESTEPS,
             cfg_value: 2.0,
             cfg_full_fraction: 1.0,
             retry_badcase: true,
-            retry_badcase_ratio_threshold: 6.0,
+            retry_badcase_ratio_threshold: DEFAULT_RETRY_BADCASE_RATIO,
             stream_decode_latent_batch: DEFAULT_STREAM_DECODE_LATENT_BATCH,
-            stream_decode_initial_latent_batch: 0,
+            stream_decode_initial_latent_batch: DEFAULT_STREAM_DECODE_INITIAL_LATENT_BATCH,
             stop_check_interval: DEFAULT_STOP_CHECK_INTERVAL,
         }
     }
 
+    /// Default production / Bailu balanced preset (also [`Default`]).
+    ///
+    /// Matches OpenBMB VoxCPM2 stop schedule plus Bailu streaming batches:
+    /// `min_len=2`, `stop_check_interval=1`, ratio `6.0`, latent VAE batches `4` then `8`.
     pub fn voice_clone() -> Self {
         Self {
-            min_len: 5,
-            max_len: 500,
+            min_len: DEFAULT_MIN_LEN,
+            max_len: DEFAULT_MAX_LEN,
             inference_timesteps: DEFAULT_INFERENCE_TIMESTEPS,
             cfg_value: 2.0,
             cfg_full_fraction: 1.0,
             retry_badcase: true,
-            retry_badcase_ratio_threshold: 3.0,
+            retry_badcase_ratio_threshold: DEFAULT_RETRY_BADCASE_RATIO,
             stream_decode_latent_batch: DEFAULT_STREAM_DECODE_LATENT_BATCH,
-            stream_decode_initial_latent_batch: 0,
+            stream_decode_initial_latent_batch: DEFAULT_STREAM_DECODE_INITIAL_LATENT_BATCH,
             stop_check_interval: DEFAULT_STOP_CHECK_INTERVAL,
         }
     }
@@ -96,15 +134,15 @@ impl VoxCPMGenerationConfig {
     /// Lower TTFA: fewer Euler steps, smaller VAE batches, less frequent stop checks.
     pub fn low_latency() -> Self {
         Self {
-            min_len: 5,
-            max_len: 500,
+            min_len: DEFAULT_MIN_LEN,
+            max_len: DEFAULT_MAX_LEN,
             inference_timesteps: 8,
             cfg_value: 2.0,
             cfg_full_fraction: 1.0,
             retry_badcase: true,
-            retry_badcase_ratio_threshold: 3.0,
+            retry_badcase_ratio_threshold: DEFAULT_RETRY_BADCASE_RATIO,
             stream_decode_latent_batch: 2,
-            stream_decode_initial_latent_batch: 0,
+            stream_decode_initial_latent_batch: 2,
             stop_check_interval: 2,
         }
     }
@@ -112,15 +150,16 @@ impl VoxCPMGenerationConfig {
     /// Metal GPU RTF preset: fewer Euler steps, less frequent stop syncs, larger VAE batches.
     pub fn metal_rtf() -> Self {
         Self {
-            min_len: 5,
-            max_len: 500,
+            min_len: DEFAULT_MIN_LEN,
+            max_len: DEFAULT_MAX_LEN,
             inference_timesteps: 8,
             cfg_value: 2.0,
             cfg_full_fraction: 1.0,
             retry_badcase: true,
-            retry_badcase_ratio_threshold: 3.0,
-            stream_decode_latent_batch: 8,
-            stream_decode_initial_latent_batch: 0,
+            retry_badcase_ratio_threshold: DEFAULT_RETRY_BADCASE_RATIO,
+            stream_decode_latent_batch: DEFAULT_STREAM_DECODE_LATENT_BATCH,
+            stream_decode_initial_latent_batch: DEFAULT_STREAM_DECODE_INITIAL_LATENT_BATCH,
+            // Coarser stop polling trades tail precision for fewer host syncs.
             stop_check_interval: 4,
         }
     }
@@ -292,6 +331,12 @@ impl VoxCPMGenerator {
         })
     }
 
+    /// Diagnostics from the most recently completed batch or fully consumed stream.
+    #[must_use]
+    pub fn last_diagnostics(&self) -> Option<VoxCPMGenerationDiagnostics> {
+        self.voxcpm.last_diagnostics()
+    }
+
     fn apply_generation_seed(&self) -> Result<()> {
         if let Some(seed) = self.generation_seed {
             match self.voxcpm.device().location() {
@@ -458,6 +503,37 @@ impl Iterator for PcmStreamIter<'_> {
                 )
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn voice_clone_stop_schedule_matches_upstream_quality() {
+        let cfg = VoxCPMGenerationConfig::voice_clone();
+        assert_eq!(cfg.min_len, 2);
+        assert_eq!(cfg.stop_check_interval, 1);
+        assert!((cfg.retry_badcase_ratio_threshold - 6.0).abs() < 1e-9);
+        assert_eq!(cfg.stream_decode_initial_latent_batch, 4);
+        assert_eq!(cfg.stream_decode_latent_batch, 8);
+        assert_eq!(cfg.inference_timesteps, 10);
+        assert!((cfg.cfg_full_fraction - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn effective_max_len_scales_with_tokens_until_cap() {
+        let cfg = VoxCPMGenerationConfig::voice_clone();
+        assert_eq!(cfg.effective_max_len(10), 70); // 6*10+10
+        assert_eq!(cfg.effective_max_len(100), 500); // capped
+        assert_eq!(cfg.effective_max_len(200), 500);
+    }
+
+    #[test]
+    fn stop_reason_labels() {
+        assert_eq!(VoxCPMStopReason::StopHead.as_str(), "stop_head");
+        assert_eq!(VoxCPMStopReason::MaxLen.as_str(), "max_len");
     }
 }
 

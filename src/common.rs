@@ -1,13 +1,11 @@
 use anyhow::Result;
-use candle_core::{DType, Tensor, D};
 #[cfg(feature = "metal")]
 use candle_core::DeviceLocation;
+use candle_core::{DType, Tensor, D};
 use candle_nn::{Activation, Module, VarBuilder};
 
 use crate::kv_cache::KvCache;
-use crate::linear::{
-    fused_linear_x, linear_x, FusedLinearX, LinearX,
-};
+use crate::linear::{fused_linear_x, linear_x, FusedLinearX, LinearX};
 use crate::position_embed::rope::apply_rotary_pos_emb;
 use crate::quant::QuantBuildCtx;
 use crate::utils::tensor::repeat_kv;
@@ -128,15 +126,7 @@ pub fn attention_forward(
             let q = query_states.contiguous()?;
             let k = key_states.contiguous()?;
             let v = value_states.contiguous()?;
-            let out = candle_nn::ops::sdpa(
-                &q,
-                &k,
-                &v,
-                attention_mask,
-                false,
-                scaling as f32,
-                1.0,
-            )?;
+            let out = candle_nn::ops::sdpa(&q, &k, &v, attention_mask, false, scaling as f32, 1.0)?;
             return Ok(out.transpose(1, 2)?.contiguous()?);
         }
     }
@@ -265,11 +255,7 @@ pub struct NaiveAttention {
 #[derive(Debug)]
 enum QkvProjs {
     Fused(FusedLinearX),
-    Separate {
-        q: LinearX,
-        k: LinearX,
-        v: LinearX,
-    },
+    Separate { q: LinearX, k: LinearX, v: LinearX },
 }
 
 impl NaiveAttention {
@@ -293,26 +279,58 @@ impl NaiveAttention {
         let qkv = if !bias {
             match fused_linear_x(
                 hidden_size,
-                &[
-                    ("q_proj", q_out),
-                    ("k_proj", kv_out),
-                    ("v_proj", kv_out),
-                ],
+                &[("q_proj", q_out), ("k_proj", kv_out), ("v_proj", kv_out)],
                 vb.clone(),
                 qctx,
             )? {
                 Some(fused) => QkvProjs::Fused(fused),
                 None => QkvProjs::Separate {
-                    q: linear_x(hidden_size, q_out, vb.pp("q_proj"), &qctx.pp("q_proj"), false)?,
-                    k: linear_x(hidden_size, kv_out, vb.pp("k_proj"), &qctx.pp("k_proj"), false)?,
-                    v: linear_x(hidden_size, kv_out, vb.pp("v_proj"), &qctx.pp("v_proj"), false)?,
+                    q: linear_x(
+                        hidden_size,
+                        q_out,
+                        vb.pp("q_proj"),
+                        &qctx.pp("q_proj"),
+                        false,
+                    )?,
+                    k: linear_x(
+                        hidden_size,
+                        kv_out,
+                        vb.pp("k_proj"),
+                        &qctx.pp("k_proj"),
+                        false,
+                    )?,
+                    v: linear_x(
+                        hidden_size,
+                        kv_out,
+                        vb.pp("v_proj"),
+                        &qctx.pp("v_proj"),
+                        false,
+                    )?,
                 },
             }
         } else {
             QkvProjs::Separate {
-                q: linear_x(hidden_size, q_out, vb.pp("q_proj"), &qctx.pp("q_proj"), bias)?,
-                k: linear_x(hidden_size, kv_out, vb.pp("k_proj"), &qctx.pp("k_proj"), bias)?,
-                v: linear_x(hidden_size, kv_out, vb.pp("v_proj"), &qctx.pp("v_proj"), bias)?,
+                q: linear_x(
+                    hidden_size,
+                    q_out,
+                    vb.pp("q_proj"),
+                    &qctx.pp("q_proj"),
+                    bias,
+                )?,
+                k: linear_x(
+                    hidden_size,
+                    kv_out,
+                    vb.pp("k_proj"),
+                    &qctx.pp("k_proj"),
+                    bias,
+                )?,
+                v: linear_x(
+                    hidden_size,
+                    kv_out,
+                    vb.pp("v_proj"),
+                    &qctx.pp("v_proj"),
+                    bias,
+                )?,
             }
         };
         let o_proj = linear_x(
@@ -343,9 +361,7 @@ impl NaiveAttention {
                 let parts = fused.forward_split(xs)?;
                 Ok((parts[0].clone(), parts[1].clone(), parts[2].clone()))
             }
-            QkvProjs::Separate { q, k, v } => {
-                Ok((q.forward(xs)?, k.forward(xs)?, v.forward(xs)?))
-            }
+            QkvProjs::Separate { q, k, v } => Ok((q.forward(xs)?, k.forward(xs)?, v.forward(xs)?)),
         }
     }
 
@@ -602,7 +618,10 @@ mod tests {
             .unwrap()
             .to_scalar::<f32>()
             .unwrap();
-        assert!(diff < 1e-5, "attention_forward must equal eager on CPU, max_diff={diff}");
+        assert!(
+            diff < 1e-5,
+            "attention_forward must equal eager on CPU, max_diff={diff}"
+        );
     }
 
     #[test]
@@ -708,8 +727,7 @@ mod tests {
                 .contiguous()
                 .unwrap();
             let scale = 1.0 / (128f64).sqrt();
-            let Ok(fused) = candle_nn::ops::sdpa(&q, &k, &v, None, false, scale as f32, 1.0)
-            else {
+            let Ok(fused) = candle_nn::ops::sdpa(&q, &k, &v, None, false, scale as f32, 1.0) else {
                 continue;
             };
             let mean = fused

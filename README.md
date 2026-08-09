@@ -171,7 +171,7 @@ Override at runtime: `BAILU_VOXCPM_QUANT=none|q8_0|…`, `BAILU_VOXCPM_CFG_FULL_
 | `low_latency()` | Smaller VAE batches, fewer stop checks |
 | `metal_rtf()` | Metal throughput tuning |
 
-Key fields: `inference_timesteps` (default **10**), `cfg_value` (**2.0**), `cfg_full_fraction` (**1.0** = official full CFG), `max_len`, `stream_decode_latent_batch`, `stream_decode_initial_latent_batch`, `stop_check_interval`, `retry_badcase`.
+Default `voice_clone()` / `Default` (Bailu production sync): `inference_timesteps=10`, `cfg_value=2.0`, `cfg_full_fraction=1.0`, `min_len=2`, `max_len=500`, `retry_badcase_ratio_threshold=6.0`, `stream_decode_initial_latent_batch=4`, `stream_decode_latent_batch=8`, `stop_check_interval=1`. (`retry_badcase` only scales the latent budget in this port — it does not retry seeds.) After generation, `VoxCPMGenerator::last_diagnostics()` reports `stop_reason` (`stop_head` | `max_len`), latent count, and effective max length.
 
 ## Weight quantization
 

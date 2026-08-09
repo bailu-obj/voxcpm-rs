@@ -10,7 +10,7 @@ use std::{
 use crate::{
     audio_vae::AudioVAE,
     config::{CfmConfig, VoxCPMConfig, VoxMiniCPM4Config},
-    generate::VoxCPMGenerationConfig,
+    generate::{VoxCPMGenerationConfig, VoxCPMGenerationDiagnostics, VoxCPMStopReason},
     linear::{linear_x, LinearX},
     minicpm4::MiniCPMModel,
     profile::{profile_stream_enabled, stage_capture_enabled, InferenceStepProfile, StageProfile},
@@ -37,6 +37,7 @@ struct GenerationParams {
     stream_decode_latent_batch: usize,
     stream_decode_initial_latent_batch: usize,
     stop_check_interval: usize,
+    target_text_tokens: usize,
 }
 
 impl GenerationParams {
@@ -50,6 +51,7 @@ impl GenerationParams {
             stream_decode_latent_batch: config.stream_decode_latent_batch(),
             stream_decode_initial_latent_batch: config.stream_decode_initial_latent_batch(),
             stop_check_interval: config.stop_check_interval.max(1),
+            target_text_tokens: target_text_len,
         }
     }
 }
@@ -390,15 +392,20 @@ impl VoxCPMLocDiT {
         Ok(hidden)
     }
 
-    fn zero_dt_emb_for_batch(&mut self, batch: usize, dtype: DType, device: &Device) -> Result<Tensor> {
-        let need_new = self.zero_dt_emb_cache.as_ref().map_or(
-            true,
-            |(cached_b, cached_dtype, cached)| {
-                *cached_b != batch
-                    || *cached_dtype != dtype
-                    || cached.device().location() != device.location()
-            },
-        );
+    fn zero_dt_emb_for_batch(
+        &mut self,
+        batch: usize,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<Tensor> {
+        let need_new =
+            self.zero_dt_emb_cache
+                .as_ref()
+                .map_or(true, |(cached_b, cached_dtype, cached)| {
+                    *cached_b != batch
+                        || *cached_dtype != dtype
+                        || cached.device().location() != device.location()
+                });
         if need_new {
             let zero_dt = Tensor::zeros(batch, dtype, device)?;
             let emb = self
@@ -527,11 +534,10 @@ impl UnifiedCFM {
             let mut dt_steps = Vec::with_capacity(n_timesteps);
             let fold_dt = !self.mean_mode;
             let zero_dt = if fold_dt {
-                Some(self.estimator.zero_dt_emb_for_batch(
-                    batch_size,
-                    dtype,
-                    t_span.device(),
-                )?)
+                Some(
+                    self.estimator
+                        .zero_dt_emb_for_batch(batch_size, dtype, t_span.device())?,
+                )
             } else {
                 None
             };
@@ -810,6 +816,7 @@ pub struct VoxCPMModel {
     device: Device,
     dtype: DType,
     quant_stats: QuantStats,
+    last_diagnostics: Option<VoxCPMGenerationDiagnostics>,
 }
 
 impl VoxCPMModel {
@@ -956,6 +963,7 @@ impl VoxCPMModel {
             device: vb.device().clone(),
             dtype: vb.dtype(),
             quant_stats,
+            last_diagnostics: None,
         })
     }
 
@@ -967,6 +975,11 @@ impl VoxCPMModel {
     #[must_use]
     pub fn device(&self) -> &Device {
         &self.device
+    }
+
+    #[must_use]
+    pub fn last_diagnostics(&self) -> Option<VoxCPMGenerationDiagnostics> {
+        self.last_diagnostics
     }
 
     fn fusion_forward(&self, left: &Tensor, right: &Tensor) -> Result<Tensor> {
@@ -1437,6 +1450,7 @@ impl VoxCPMModel {
             i: 0,
             params,
             finished: false,
+            stop_reason: None,
             use_voxcpm2: false,
             feat_embed_cache: None,
             seq_tokens: t,
@@ -1543,6 +1557,7 @@ impl VoxCPMModel {
             i: 0,
             params,
             finished: false,
+            stop_reason: None,
             use_voxcpm2: true,
             feat_embed_cache,
             seq_tokens,
@@ -1587,6 +1602,7 @@ pub struct VoxCPMInferenceStream<'a> {
     i: usize,
     params: GenerationParams,
     finished: bool,
+    stop_reason: Option<VoxCPMStopReason>,
     use_voxcpm2: bool,
     #[allow(dead_code)]
     feat_embed_cache: Option<Tensor>,
@@ -1596,11 +1612,27 @@ pub struct VoxCPMInferenceStream<'a> {
     prefill_elapsed: Option<Duration>,
 }
 
+impl VoxCPMInferenceStream<'_> {
+    fn diagnostics(&self) -> Option<VoxCPMGenerationDiagnostics> {
+        let stop_reason = self.stop_reason?;
+        Some(VoxCPMGenerationDiagnostics {
+            stop_reason,
+            latent_count: self.i,
+            target_text_tokens: self.params.target_text_tokens,
+            effective_max_len: self.params.max_len,
+        })
+    }
+}
+
 impl<'a> Iterator for VoxCPMInferenceStream<'a> {
     type Item = Result<Tensor>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.finished || self.i >= self.params.max_len {
+        if self.finished {
+            return None;
+        }
+        if self.i >= self.params.max_len {
+            self.stop_reason = Some(VoxCPMStopReason::MaxLen);
             return None;
         }
 
@@ -1667,6 +1699,7 @@ impl<'a> Iterator for VoxCPMInferenceStream<'a> {
 
             if stop_flag == 1 {
                 self.finished = true;
+                self.stop_reason = Some(VoxCPMStopReason::StopHead);
             }
         }
 
@@ -1759,6 +1792,9 @@ impl<'a> Iterator for VoxCPMInferenceStream<'a> {
 
 impl<'a> Drop for VoxCPMInferenceStream<'a> {
     fn drop(&mut self) {
+        if let Some(diagnostics) = self.diagnostics() {
+            self.model.last_diagnostics = Some(diagnostics);
+        }
         if let Some(profile) = &self.step_profile {
             profile.print_summary();
             if stage_capture_enabled() {
@@ -1824,6 +1860,12 @@ pub(crate) fn trim_stream_audio_chunk(
 }
 
 impl<'a> VoxCPMGenerateStream<'a> {
+    /// Stop / length diagnostics for the underlying latent stream.
+    #[must_use]
+    pub fn diagnostics(&self) -> Option<VoxCPMGenerationDiagnostics> {
+        self.inf_stream.diagnostics()
+    }
+
     fn prepare_stream_chunk(&mut self, audio: Tensor, final_chunk: bool) -> Result<Option<Tensor>> {
         trim_stream_audio_chunk(
             audio,
@@ -1957,8 +1999,7 @@ impl<'a> Iterator for VoxCPMGenerateStream<'a> {
                             Ok(audio_chunk) => {
                                 match self.prepare_stream_chunk(audio_chunk, false) {
                                     Ok(Some(trimmed)) => {
-                                        if let Some(to_yield) =
-                                            self.pending_chunk.replace(trimmed)
+                                        if let Some(to_yield) = self.pending_chunk.replace(trimmed)
                                         {
                                             return Some(Ok(to_yield));
                                         }
