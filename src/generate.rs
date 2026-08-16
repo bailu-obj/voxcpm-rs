@@ -451,7 +451,23 @@ impl VoxCPMGenerator {
         let stream = self.generate_stream_with_config(target_text, config)?;
         Ok(Box::new(PcmStreamIter {
             inner: stream,
-            normalizer: crate::utils::audio::StreamPcmNormalizer::new(),
+            normalizer: PcmNormalizerSlot::Owned(crate::utils::audio::StreamPcmNormalizer::new()),
+        }))
+    }
+
+    /// Streaming PCM generation that shares a caller-owned
+    /// [`StreamPcmNormalizer`](crate::utils::audio::StreamPcmNormalizer), so PCM gain stays
+    /// continuous across successive streams (e.g. text segments of one reply).
+    pub fn generate_pcm_stream_with_normalizer<'a>(
+        &'a mut self,
+        target_text: String,
+        config: VoxCPMGenerationConfig,
+        normalizer: &'a mut crate::utils::audio::StreamPcmNormalizer,
+    ) -> Result<Box<dyn Iterator<Item = Result<Vec<i16>>> + 'a>> {
+        let stream = self.generate_stream_with_config(target_text, config)?;
+        Ok(Box::new(PcmStreamIter {
+            inner: stream,
+            normalizer: PcmNormalizerSlot::Shared(normalizer),
         }))
     }
 
@@ -488,7 +504,23 @@ impl VoxCPMGenerator {
 
 struct PcmStreamIter<'a> {
     inner: Box<dyn Iterator<Item = Result<Tensor>> + 'a>,
-    normalizer: crate::utils::audio::StreamPcmNormalizer,
+    normalizer: PcmNormalizerSlot<'a>,
+}
+
+/// Per-stream PCM normalizer: fresh per stream by default, or caller-shared so gain stays
+/// continuous across streams of one logical utterance.
+enum PcmNormalizerSlot<'a> {
+    Owned(crate::utils::audio::StreamPcmNormalizer),
+    Shared(&'a mut crate::utils::audio::StreamPcmNormalizer),
+}
+
+impl PcmNormalizerSlot<'_> {
+    fn get_mut(&mut self) -> &mut crate::utils::audio::StreamPcmNormalizer {
+        match self {
+            Self::Owned(normalizer) => normalizer,
+            Self::Shared(normalizer) => normalizer,
+        }
+    }
 }
 
 impl Iterator for PcmStreamIter<'_> {
@@ -499,7 +531,7 @@ impl Iterator for PcmStreamIter<'_> {
             res.and_then(|tensor| {
                 crate::utils::audio::to_pcm_stream_chunk_with_normalizer(
                     &tensor,
-                    &mut self.normalizer,
+                    self.normalizer.get_mut(),
                 )
             })
         })
@@ -534,6 +566,42 @@ mod tests {
     fn stop_reason_labels() {
         assert_eq!(VoxCPMStopReason::StopHead.as_str(), "stop_head");
         assert_eq!(VoxCPMStopReason::MaxLen.as_str(), "max_len");
+    }
+
+    #[test]
+    fn shared_normalizer_keeps_gain_across_streams() -> Result<()> {
+        use candle_core::{Device, Tensor};
+
+        fn chunk(value: f32) -> Result<Tensor> {
+            Ok(Tensor::from_slice(&[value, -value], 2, &Device::Cpu)?.unsqueeze(0)?)
+        }
+
+        let mut normalizer = crate::utils::audio::StreamPcmNormalizer::new();
+        // First "stream" peaks at 2.0 → scale 32767/2.
+        let first: Vec<Vec<i16>> = PcmStreamIter {
+            inner: Box::new(vec![chunk(2.0)].into_iter()),
+            normalizer: PcmNormalizerSlot::Shared(&mut normalizer),
+        }
+        .collect::<Result<_>>()?;
+        assert_eq!(first, vec![vec![32767, -32767]]);
+        assert!((normalizer.running_peak() - 2.0).abs() < 1e-6);
+
+        // Second "stream" peaks at 0.5 but keeps the first stream's gain (no reset).
+        let second: Vec<Vec<i16>> = PcmStreamIter {
+            inner: Box::new(vec![chunk(0.5)].into_iter()),
+            normalizer: PcmNormalizerSlot::Shared(&mut normalizer),
+        }
+        .collect::<Result<_>>()?;
+        assert_eq!(second, vec![vec![8192, -8192]]);
+
+        // Owned slot (default path) still resets per stream.
+        let third: Vec<Vec<i16>> = PcmStreamIter {
+            inner: Box::new(vec![chunk(0.5)].into_iter()),
+            normalizer: PcmNormalizerSlot::Owned(crate::utils::audio::StreamPcmNormalizer::new()),
+        }
+        .collect::<Result<_>>()?;
+        assert_eq!(third, vec![vec![16384, -16384]]);
+        Ok(())
     }
 }
 

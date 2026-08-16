@@ -27,6 +27,11 @@ struct VoxCPM2InputLayout {
     audio_ranges: Vec<(usize, usize)>,
 }
 
+/// Upstream `streaming_prefix_len` default (OpenBMB `voxcpm2.py`): in continuation mode the
+/// last `STREAMING_PREFIX_LEN - 1` prompt audio patches seed the VAE decode so the first
+/// generated phoneme decodes against real context instead of a zero-padded boundary.
+const STREAMING_PREFIX_LEN: usize = 4;
+
 #[derive(Debug, Clone, Copy)]
 struct GenerationParams {
     min_len: usize,
@@ -1270,6 +1275,43 @@ impl VoxCPMModel {
         Ok(decode_audio)
     }
 
+    /// Trailing prompt-audio patches used to seed the VAE decode, matching upstream
+    /// `_inference` continuation mode: when the prompt ends with audio
+    /// (`feat_mask[0, -1] == 1`), `context_len = min(streaming_prefix_len - 1,
+    /// len(audio_indices))` and the last `context_len` audio patches are prepended to the
+    /// decoded latents (their samples are trimmed from the output afterwards).
+    ///
+    /// `audio_feat` is `(1, T, patch_size, D)` and `audio_mask` is `(1, L)`; continuation
+    /// prompts keep their audio patches as the trailing rows of `audio_feat`. Returns the
+    /// context in VAE latent layout `(1, D, context_len * patch_size)` plus `context_len`,
+    /// or `None` for zero-shot / reference-only prompts (no seeding, no leading trim).
+    fn prompt_decode_context(
+        &self,
+        audio_feat: &Tensor,
+        audio_mask: &Tensor,
+    ) -> Result<Option<(Tensor, usize)>> {
+        let mask = audio_mask
+            .squeeze(0)?
+            .to_dtype(DType::F32)?
+            .to_vec1::<f32>()?;
+        if mask.last().is_none_or(|&m| m <= 0.0) {
+            return Ok(None);
+        }
+        let audio_patches = mask.iter().filter(|&&m| m > 0.0).count();
+        let context_len = (STREAMING_PREFIX_LEN - 1).min(audio_patches);
+        if context_len == 0 {
+            return Ok(None);
+        }
+        let feat_len = audio_feat.dim(1)?;
+        let context = audio_feat
+            .narrow(1, feat_len - context_len, context_len)?
+            .contiguous()?
+            .reshape((1, context_len * self.patch_size, self.audio_vae.latent_dim))?
+            .permute((0, 2, 1))?
+            .contiguous()?;
+        Ok(Some((context, context_len)))
+    }
+
     fn _generate(
         &mut self,
         text_token: &Tensor,
@@ -1284,6 +1326,7 @@ impl VoxCPMModel {
         let audio_feat = audio_feat.unsqueeze(0)?.to_dtype(self.dtype)?;
         let audio_mask = audio_mask.unsqueeze(0)?;
 
+        let decode_context = self.prompt_decode_context(&audio_feat, &audio_mask)?;
         let latent_pred = self.inference(
             &text_token,
             &text_mask,
@@ -1292,17 +1335,31 @@ impl VoxCPMModel {
             params,
             layout,
         )?;
+        // Continuation mode: decode the trailing prompt patches together with the generated
+        // latents, then drop exactly `context_len` decode-side patches from the head
+        // (upstream `_generate`: `decode_audio[..., patch_size * decode_chunk_size *
+        // context_len:]`). Zero-shot / reference-only: no leading trim at all.
+        let (decode_input, leading_trim) = match decode_context {
+            Some((context, context_len)) => (
+                Tensor::cat(
+                    &[&context.to_dtype(latent_pred.dtype())?, &latent_pred],
+                    D::Minus1,
+                )?,
+                context_len * self.patch_size * self.audio_vae.decode_chunk_size,
+            ),
+            None => (latent_pred, 0),
+        };
         let vae_start = stage_capture_enabled().then(Instant::now);
-        let decode_audio = self.audio_vae.decode(&latent_pred, None)?.squeeze(1)?;
+        let decode_audio = self.audio_vae.decode(&decode_input, None)?.squeeze(1)?;
         if let Some(start) = vae_start {
             StageProfile::add_vae_decode(start.elapsed());
         }
-        let boundary_trim = self.chunk_size;
+        let trailing_trim = self.chunk_size;
         let audio_len = decode_audio.dim(D::Minus1)?;
         let decode_audio = decode_audio.narrow(
             D::Minus1,
-            boundary_trim,
-            audio_len.saturating_sub(2 * boundary_trim),
+            leading_trim,
+            audio_len.saturating_sub(leading_trim + trailing_trim),
         )?;
         Ok(decode_audio)
     }
@@ -1320,7 +1377,14 @@ impl VoxCPMModel {
         let text_mask = text_mask.unsqueeze(0)?;
         let audio_feat = audio_feat.unsqueeze(0)?.to_dtype(self.dtype)?;
         let audio_mask = audio_mask.unsqueeze(0)?;
+        let decode_context = self.prompt_decode_context(&audio_feat, &audio_mask)?;
+        // Trailing-edge trim still applies on the final chunk; the leading trim now covers
+        // exactly the seeded context span (`context_len` decode-side patches), or 0 when the
+        // prompt has no continuation audio.
         let boundary_trim_samples = self.chunk_size;
+        let leading_trim_remaining = decode_context.as_ref().map_or(0, |(_, context_len)| {
+            context_len * self.patch_size * self.audio_vae.decode_chunk_size
+        });
         let inf_stream = self.inference_stream(
             &text_token,
             &text_mask,
@@ -1334,12 +1398,13 @@ impl VoxCPMModel {
             inf_stream,
             vae_state: None,
             pending_latents: Vec::with_capacity(params.stream_decode_initial_latent_batch),
+            context_latents: decode_context.map(|(latents, _)| latents),
             stream_decode_latent_batch: params.stream_decode_latent_batch,
             stream_decode_initial_latent_batch: params.stream_decode_initial_latent_batch,
             initial_decode_done: false,
             pending_chunk: None,
             boundary_trim_samples,
-            leading_trim_remaining: boundary_trim_samples,
+            leading_trim_remaining,
             profile_enabled: profile_stream_enabled() || stage_capture_enabled(),
             profile_inf_time: Duration::ZERO,
             profile_vae_time: Duration::ZERO,
@@ -1815,12 +1880,20 @@ pub struct VoxCPMGenerateStream<'a> {
     inf_stream: VoxCPMInferenceStream<'a>,
     vae_state: Option<crate::audio_vae::DecoderState>,
     pending_latents: Vec<Tensor>,
+    /// Trailing prompt-audio patches (VAE latent layout) prepended to the first streaming
+    /// decode so the causal decoder state is warmed with real context (upstream
+    /// continuation-mode `pred_feat_seq` seeding). Their decoded samples are discarded via
+    /// `leading_trim_remaining`.
+    context_latents: Option<Tensor>,
     stream_decode_latent_batch: usize,
     stream_decode_initial_latent_batch: usize,
     initial_decode_done: bool,
     pending_chunk: Option<Tensor>,
-    /// VAE hop / chunk size; matches batch `decode()` leading+trailing trim (one chunk each end).
+    /// VAE hop / chunk size; trailing trim applied to the final chunk only (matches the
+    /// batch `decode()` trailing trim).
     boundary_trim_samples: usize,
+    /// Samples still to discard from the stream head: exactly the seeded context span
+    /// (`context_len * patch_size * decode_chunk_size`), or 0 without continuation audio.
     leading_trim_remaining: usize,
     profile_enabled: bool,
     profile_inf_time: Duration,
@@ -1830,7 +1903,9 @@ pub struct VoxCPMGenerateStream<'a> {
     finished: bool,
 }
 
-/// Trim VAE boundary padding from a streaming decode chunk to match batch `decode()` output.
+/// Trim a streaming decode chunk: drop `leading_trim_remaining` samples from the stream
+/// head (the seeded prompt-context span) and `boundary_trim` samples from the tail of the
+/// final chunk, matching batch `decode()` output.
 ///
 /// Returns `None` when the chunk is fully consumed by trim (caller should skip yield).
 pub(crate) fn trim_stream_audio_chunk(
@@ -1896,7 +1971,7 @@ impl<'a> VoxCPMGenerateStream<'a> {
             Vec::with_capacity(self.stream_decode_latent_batch.max(required)),
         );
         let model_dtype = self.inf_stream.model.dtype;
-        let latents: Vec<Tensor> = match latents
+        let mut latents: Vec<Tensor> = match latents
             .into_iter()
             .map(|t| {
                 if t.dtype() == model_dtype {
@@ -1910,6 +1985,13 @@ impl<'a> VoxCPMGenerateStream<'a> {
             Ok(v) => v,
             Err(e) => return Some(Err(anyhow::Error::from(e))),
         };
+        // Seed the first decode with the trailing prompt patches so the causal VAE state is
+        // built from real audio context; their samples are discarded by the leading trim.
+        if !self.initial_decode_done {
+            if let Some(context) = self.context_latents.take() {
+                latents.insert(0, context);
+            }
+        }
         let latent_refs: Vec<&Tensor> = latents.iter().collect();
         let latent_vae = match Tensor::cat(&latent_refs, D::Minus1) {
             Ok(t) => t,
@@ -2144,13 +2226,18 @@ mod stream_trim_tests {
     }
 
     #[test]
-    fn leading_trim_removes_boundary_prefix() -> Result<()> {
+    fn leading_trim_removes_context_prefix() -> Result<()> {
+        // Leading trim discards exactly the seeded prompt-context span from the stream head.
         let boundary = 4usize;
-        let mut leading = boundary;
-        let audio = mono_chunk(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0])?;
+        let mut leading = 2 * boundary; // e.g. context_len=2 decode-side patches of `boundary`
+        let audio = mono_chunk(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0])?;
         let trimmed = trim_stream_audio_chunk(audio, boundary, &mut leading, false)?.unwrap();
         assert_eq!(leading, 0);
-        assert_eq!(chunk_values(&trimmed)?, vec![4.0, 5.0, 6.0, 7.0]);
+        assert_eq!(
+            chunk_values(&trimmed)?,
+            vec![8.0, 9.0],
+            "context span consumed from the head; no extra boundary trim"
+        );
         Ok(())
     }
 
@@ -2195,6 +2282,62 @@ mod stream_trim_tests {
         let mut leading = 0usize;
         let audio = mono_chunk(&[1.0, 2.0, 3.0, 4.0])?;
         assert!(trim_stream_audio_chunk(audio, boundary, &mut leading, true)?.is_none());
+        Ok(())
+    }
+
+    /// VoxCPM2 context-trim math: `leading = context_len * patch_size * decode_chunk_size`
+    /// with `context_len = min(streaming_prefix_len - 1, prompt_patches)` = 3,
+    /// `patch_size` = 4, `decode_chunk_size` = 8*6*5*2*2*2 = 1920 (@ 48 kHz).
+    #[test]
+    fn context_trim_matches_voxcpm2_decode_patch_span() -> Result<()> {
+        const STREAMING_PREFIX_LEN: usize = 4;
+        const PATCH_SIZE: usize = 4;
+        const DECODE_CHUNK_SIZE: usize = 1920;
+        const TRAILING_TRIM: usize = 640; // encode-hop trailing trim, unchanged
+
+        let prompt_patches = 10usize;
+        let context_len = (STREAMING_PREFIX_LEN - 1).min(prompt_patches);
+        assert_eq!(context_len, 3);
+        let mut leading = context_len * PATCH_SIZE * DECODE_CHUNK_SIZE;
+        assert_eq!(leading, 23040);
+
+        // Each streaming decode patch yields `patch_size * decode_chunk_size` samples.
+        let patch_samples = PATCH_SIZE * DECODE_CHUNK_SIZE;
+        let mut emitted = Vec::new();
+        for _ in 0..4 {
+            let chunk = mono_chunk(&vec![1.0f32; patch_samples])?;
+            if let Some(trimmed) =
+                trim_stream_audio_chunk(chunk, TRAILING_TRIM, &mut leading, false)?
+            {
+                emitted.extend(chunk_values(&trimmed)?);
+            }
+        }
+        assert_eq!(leading, 0);
+        assert_eq!(
+            emitted.len(),
+            patch_samples,
+            "exactly context_len decode patches are dropped from the stream head"
+        );
+        Ok(())
+    }
+
+    /// Short prompt (fewer audio patches than `streaming_prefix_len - 1`) caps
+    /// `context_len` at the available prompt patches.
+    #[test]
+    fn context_trim_capped_by_prompt_patch_count() -> Result<()> {
+        const STREAMING_PREFIX_LEN: usize = 4;
+        const PATCH_SIZE: usize = 4;
+        const DECODE_CHUNK_SIZE: usize = 1920;
+
+        let prompt_patches = 2usize;
+        let context_len = (STREAMING_PREFIX_LEN - 1).min(prompt_patches);
+        assert_eq!(context_len, 2);
+        let mut leading = context_len * PATCH_SIZE * DECODE_CHUNK_SIZE;
+
+        let span = mono_chunk(&vec![0.5f32; leading + 100])?;
+        let trimmed = trim_stream_audio_chunk(span, 640, &mut leading, false)?.unwrap();
+        assert_eq!(leading, 0);
+        assert_eq!(trimmed.dim(D::Minus1)?, 100);
         Ok(())
     }
 }

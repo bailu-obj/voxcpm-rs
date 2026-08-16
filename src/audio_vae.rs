@@ -779,6 +779,10 @@ pub struct AudioVAE {
     pub sample_rate: usize,
     pub out_sample_rate: usize,
     pub chunk_size: usize,
+    /// Samples per latent frame at the decode (output) sample rate: product of
+    /// `decoder_rates`. Upstream `audio_vae.decode_chunk_size` (1920 for VoxCPM2 @ 48 kHz),
+    /// not the encode hop [`Self::chunk_size`].
+    pub decode_chunk_size: usize,
 }
 
 impl AudioVAE {
@@ -836,6 +840,7 @@ impl AudioVAE {
             cond_type,
         )?;
         let chunk_size = hop_length;
+        let decode_chunk_size = decoder_rates.iter().product();
         Ok(Self {
             latent_dim,
             hop_length,
@@ -845,6 +850,7 @@ impl AudioVAE {
             sample_rate,
             out_sample_rate,
             chunk_size,
+            decode_chunk_size,
         })
     }
 
