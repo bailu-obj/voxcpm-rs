@@ -20,11 +20,7 @@ Pure Rust implementation of [VoxCPM](https://huggingface.co/openbmb) text-to-spe
 - A downloaded VoxCPM checkpoint directory (see [Model layout](#model-layout))
 - For GPU inference, build with `--features metal` (macOS) or `--features cuda` (Linux)
 
-Initialize the submodule when cloning Bailu:
-
-```bash
-git submodule update --init vendor/voxcpm-rs
-```
+> **Platform status:** developed and tuned for **macOS + Apple Silicon (Metal) only** — all reference numbers below were measured on Metal. The `cuda` feature compiles but is **not yet tested on Linux + NVIDIA** (no GPU available for validation). Reports and patches for CUDA are welcome.
 
 ## Quick start
 
@@ -87,11 +83,11 @@ cargo run --release -p voxcpm-rs --features metal --example voxcpm2_benchmark --
   --inference-timesteps 10 \
   --stream-decode-initial-latent-batch 4 \
   --stream-decode-latent-batch 8 \
-  --stop-check-interval 4 \
+  --stop-check-interval 1 --min-len 2 \
   --ref-wav models/paimon_01.wav \
   --ref-text "Reference transcript matching the clip." \
   --text "好的，我来帮你查一下。请稍等片刻。" \
-  --warmup 1 --runs 3 --profile
+  --warmup 1 --runs 5 --profile
 ```
 
 ## Library usage
@@ -148,20 +144,6 @@ for chunk in gen.generate_pcm_stream_with_config("Hello.".into(), config)? {
 
 When `dtype` / `vae_dtype` are unset (`auto`), the loader picks lower precision on GPU for **non-quant** runs (typically `F16` for the LM). When **quant is enabled** and `dtype=auto`, activations default to **F32** to match `QMatMul` and avoid per-layer cast churn.
 
-### Bailu integration
-
-In [`bailu.toml`](../../bailu.toml):
-
-```toml
-[tts.voxcpm]
-quant = "q8_0"
-dtype = "f16"
-vae_dtype = "auto"
-cfg_full_fraction = 1.0   # official: CFG on every Euler step
-```
-
-Override at runtime: `BAILU_VOXCPM_QUANT=none|q8_0|…`, `BAILU_VOXCPM_CFG_FULL_FRACTION=…`. Full operator guide: [`docs/VOXCPM_QUANT.md`](../../docs/VOXCPM_QUANT.md).
-
 ### Generation presets (`VoxCPMGenerationConfig`)
 
 | Preset | Use case |
@@ -171,7 +153,7 @@ Override at runtime: `BAILU_VOXCPM_QUANT=none|q8_0|…`, `BAILU_VOXCPM_CFG_FULL_
 | `low_latency()` | Smaller VAE batches, fewer stop checks |
 | `metal_rtf()` | Metal throughput tuning |
 
-Default `voice_clone()` / `Default` (Bailu production sync): `inference_timesteps=10`, `cfg_value=2.0`, `cfg_full_fraction=1.0`, `min_len=2`, `max_len=500`, `retry_badcase_ratio_threshold=6.0`, `stream_decode_initial_latent_batch=4`, `stream_decode_latent_batch=8`, `stop_check_interval=1`. (`retry_badcase` only scales the latent budget in this port — it does not retry seeds.) After generation, `VoxCPMGenerator::last_diagnostics()` reports `stop_reason` (`stop_head` | `max_len`), latent count, and effective max length.
+Default `voice_clone()` / `Default` (balanced preset): `inference_timesteps=10`, `cfg_value=2.0`, `cfg_full_fraction=1.0`, `min_len=2`, `max_len=500`, `retry_badcase_ratio_threshold=6.0`, `stream_decode_initial_latent_batch=4`, `stream_decode_latent_batch=8`, `stop_check_interval=1`. (`retry_badcase` only scales the latent budget in this port — it does not retry seeds.) After generation, `VoxCPMGenerator::last_diagnostics()` reports `stop_reason` (`stop_head` | `max_len`), latent count, and effective max length.
 
 ## Weight quantization
 
@@ -229,38 +211,32 @@ By default, weights stay in `QMatMul` form. `VOXCPM_QUANT_DEQUANT_LINEAR=1` dequ
 | `q6_k` | 0.90 |
 | `q4_k` / `q5_k` | 0.85 |
 
-WAV/mel comparison: `scripts/voxcpm_quant_analysis/compare_wav.py --strict --min-correlation 0.95`.
-
 ### Reference performance (Metal, release)
 
-Numbers vary by machine, text length, and cold vs warm load.
+Measured on **Mac mini M4 Pro (Apple M4 Pro, 64 GB)**, 2026-08-19. Numbers vary by machine, text length, and cold vs warm load.
 
-**VoxCPM-0.5B**, `"测试"`, batch (approximate):
+**VoxCPM-0.5B**, `"测试"`, batch (median of 3):
 
 | Mode | Load | RTF | FP corr |
 |------|------|-----|---------|
-| `none` | ~0.5s | ~0.62 | — |
-| `q8_0` | ~1.0s | ~0.56 | ~0.998 |
+| `none` | ~0.5 s | ~0.70 | — |
+| `q8_0` | ~1.2 s | ~0.69 | gate-checked via `--compare-fp` |
 
-**VoxCPM2** streaming voice-clone (steps **10**, `cfg_full_fraction=1.0`, init/latent/stop **4/8/4**, `q8_0`+`f16`, medium Chinese utterance):
+**VoxCPM2** streaming voice-clone (steps **10**, `cfg_full_fraction=1.0`, init/latent/stop **4/8/1**, medium Chinese utterance ~4 s audio; seed 42, median of 5):
 
 | Build | RTF | TTFA | Notes |
 |-------|----:|-----:|-------|
-| Eager baseline (`VOXCPM_FUSED_SDPA=0`, no proj/RoPE fusion era) | ~1.17 | ~0.94 s | Official full CFG |
-| **Current defaults** (fused proj + RoPE + GQA) | **~0.91** | **~0.79 s** | corr ≥0.999 vs eager cfg-1.0 ref |
+| Eager (`VOXCPM_FUSED_SDPA=0 VOXCPM_FUSE_PROJ=0 VOXCPM_FUSED_ROPE=0`, q8_0+f16) | 1.18 | 0.98 s | 432 quantized matrices |
+| FP reference (none/auto) | 1.08 | 0.88 s | |
+| **Current defaults** (fused proj + RoPE + GQA, q8_0+f16) | **0.98** | **0.85 s** | 252 quantized matrices; corr 0.990 vs FP |
 
-Stage split via `--profile` (`cfm`, `lm`, `vae`, `VOXCPM_BOTTLENECK_HINT`). CFM/DiT remains the dominant stage. Operator baseline notes: [`docs/voxcpm2_rtf_baseline.md`](../../docs/voxcpm2_rtf_baseline.md).
+Stage split via `--profile` (`cfm`, `lm`, `vae`, `VOXCPM_BOTTLENECK_HINT`). On M4 Pro the every-latent stop head is the dominant stage (~38%), ahead of CFM/DiT (~32%).
 
 ### Benchmarking
 
 ```bash
 cargo run --release -p voxcpm-rs --features metal --example voxcpm2_benchmark -- \
   --model models/VoxCPM-0.5B --text "测试" --quant q8_0 --compare-fp --profile --runs 3
-
-# Repo scripts (from workspace root):
-VOXCPM_QUANT=q8_0 ./scripts/benchmark_voxcpm_non_stream.sh
-./scripts/voxcpm_quant_analysis/run_baseline.sh
-./scripts/voxcpm_check.sh
 ```
 
 Emits `VOXCPM_BENCH_JSON`, `VOXCPM_QUANT_JSON`, and `VOXCPM_BOTTLENECK_HINT`.
@@ -308,14 +284,19 @@ models/VoxCPM2/
 └── *.bin / *.pth        # alternative PyTorch weight layouts (also supported)
 ```
 
-Download checkpoints from [OpenBMB on Hugging Face](https://huggingface.co/openbmb) (e.g. `VoxCPM-0.5B`, `VoxCPM2`).
+Download checkpoints from Hugging Face:
+
+- [openbmb/VoxCPM2](https://huggingface.co/openbmb/VoxCPM2) — 2.29B, tokenizer-free diffusion-AR TTS, 48 kHz, voice cloning + streaming
+- [openbmb/VoxCPM-0.5B](https://huggingface.co/openbmb/VoxCPM-0.5B) — 0.5B, 16 kHz
+
+Both are Apache-2.0.
 
 ## Cargo features
 
 | Feature | Enables |
 |---------|---------|
-| `metal` | Apple GPU via Candle |
-| `cuda` | NVIDIA GPU via Candle |
+| `metal` | Apple GPU via Candle (tested / tuned) |
+| `cuda` | NVIDIA GPU via Candle (**untested** — see platform status) |
 | `flash-attn` | Optional flash-attention backend |
 
 Default features are empty; pick one GPU backend at build time for examples and downstream crates.
@@ -337,11 +318,9 @@ Unit tests run on CPU without model files:
 
 ```bash
 cargo test -p voxcpm-rs
-# or from repo root:
-./scripts/voxcpm_check.sh
 ```
 
-Doc tests and GPU examples require downloaded weights and a GPU build; exclude this crate in CI smoke tests (as Bailu does with `--exclude voxcpm-rs`).
+Doc tests and GPU examples require downloaded weights and a GPU build; exclude this crate (`--exclude voxcpm-rs`) in CI smoke tests without a GPU.
 
 ## Acknowledgments
 
