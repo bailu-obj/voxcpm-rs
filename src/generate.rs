@@ -9,13 +9,11 @@ use crate::{
     models::VoxCPMModel,
     quant::VoxCPMQuantConfig,
     tokenizer::SingleChineseTokenizer,
-    utils::device::{
-        get_compute_dtype, get_device, get_quant_compute_dtype, get_vae_compute_dtype,
-    },
+    utils::device::get_device,
 };
 
 const DEFAULT_INFERENCE_TIMESTEPS: usize = 10;
-pub const DEFAULT_STREAM_DECODE_LATENT_BATCH: usize = 8;
+pub const DEFAULT_STREAM_DECODE_LATENT_BATCH: usize = 12;
 /// Bailu/OpenBMB quality default: first streaming VAE decode batch (TTFA).
 pub const DEFAULT_STREAM_DECODE_INITIAL_LATENT_BATCH: usize = 4;
 /// Quality default: check stop head every latent (matches OpenBMB VoxCPM2).
@@ -52,13 +50,14 @@ pub struct VoxCPMGenerationDiagnostics {
     pub effective_max_len: usize,
 }
 
-/// Runtime options for model load (device, dtype, quantization).
+/// Runtime options for model load (device, quantization).
+///
+/// Compute dtype is fixed to **F32**: quantized `QMatMul` accumulates in F32 anyway,
+/// and dense F32 avoids per-layer cast kernels (measured faster on Apple Silicon).
 #[derive(Debug, Clone, Default)]
 pub struct VoxCPMGeneratorOptions {
     pub device: Option<Device>,
     pub device_id: Option<usize>,
-    pub dtype: Option<DType>,
-    pub vae_dtype: Option<DType>,
     pub quant: VoxCPMQuantConfig,
     /// Fixed RNG seed for reproducible generation (compare / tests).
     pub seed: Option<u64>,
@@ -115,7 +114,7 @@ impl VoxCPMGenerationConfig {
     /// Default production / Bailu balanced preset (also [`Default`]).
     ///
     /// Matches OpenBMB VoxCPM2 stop schedule plus Bailu streaming batches:
-    /// `min_len=2`, `stop_check_interval=1`, ratio `6.0`, latent VAE batches `4` then `8`.
+    /// `min_len=2`, `stop_check_interval=1`, ratio `6.0`, latent VAE batches `4` then `12`.
     pub fn voice_clone() -> Self {
         Self {
             min_len: DEFAULT_MIN_LEN,
@@ -197,49 +196,58 @@ pub struct VoxCPMGenerator {
     generation_seed: Option<u64>,
 }
 
+/// Resolve main-model load dtype (no user-facing option).
+///
+/// Quant path: **F32 activations** — `QMatMul` accumulates in F32, so half-precision
+/// activations only add per-layer cast churn (measured ~3% RTF slower on Apple Silicon).
+/// Dense path (`quant=none`): keep the checkpoint dtype (BF16 for current VoxCPM
+/// checkpoints); F32-declaring configs downcast to F16 on GPU (weight-stream-bound at
+/// decode batch sizes).
+fn resolve_model_dtype(quant_enabled: bool, cfg_dtype: &str, device: &Device) -> DType {
+    if quant_enabled {
+        return DType::F32;
+    }
+    match cfg_dtype.trim().to_lowercase().as_str() {
+        "bfloat16" | "bf16" => DType::BF16,
+        "float16" | "half" | "f16" => DType::F16,
+        _ => match device.location() {
+            DeviceLocation::Cpu => DType::F32,
+            _ => DType::F16,
+        },
+    }
+}
+
 impl VoxCPMGenerator {
     /// Initialize VoxCPM model from path (backward-compatible defaults).
-    pub fn new(path: &str, device: Option<&Device>, dtype: Option<DType>) -> Result<Self> {
+    pub fn new(path: &str, device: Option<&Device>) -> Result<Self> {
         let mut options = VoxCPMGeneratorOptions::default();
         options.device = device.cloned();
-        options.dtype = dtype;
         Self::new_with_options(path, &options)
     }
 
     /// Initialize VoxCPM model with full runtime options.
     pub fn new_with_options(path: &str, options: &VoxCPMGeneratorOptions) -> Result<Self> {
         let device = get_device(options.device.as_ref(), options.device_id);
-        let dtype = options.dtype;
-        let vae_dtype_override = options.vae_dtype;
         let config_path = path.to_string() + "/config.json";
         let config: VoxCPMConfig = serde_json::from_slice(&std::fs::read(config_path)?)?;
 
         // Load VAE weights: prefer mmap safetensors (e.g. `*vae*.safetensors`), else PyTorch `.pth`.
         let vae_safetensors = find_vae_safetensors(path)?;
-        let (vb_vae, _vae_dtype) = if !vae_safetensors.is_empty() {
-            let vae_dtype = get_vae_compute_dtype(vae_dtype_override, DType::F32, &device);
+        let vb_vae = if !vae_safetensors.is_empty() {
             let vb = unsafe {
-                VarBuilder::from_mmaped_safetensors(&vae_safetensors, vae_dtype, &device)?
+                VarBuilder::from_mmaped_safetensors(&vae_safetensors, DType::F32, &device)?
             };
-            (vb, vae_dtype)
+            vb
         } else {
             let model_list = find_type_files(path, "pth")?;
             let mut dict_to_hashmap = HashMap::new();
-            let mut vae_dtype = DType::F32;
-
             for m in model_list {
                 let dict = read_all_with_key(m, Some("state_dict"))?;
-                vae_dtype = dict[0].1.dtype();
                 for (k, v) in dict {
                     dict_to_hashmap.insert(k, v);
                 }
             }
-
-            let vae_dtype = get_vae_compute_dtype(vae_dtype_override, vae_dtype, &device);
-            (
-                VarBuilder::from_tensors(dict_to_hashmap, vae_dtype, &device),
-                vae_dtype,
-            )
+            VarBuilder::from_tensors(dict_to_hashmap, DType::F32, &device)
         };
         let audio_config = match config.audio_vae_config.clone() {
             Some(config) => config,
@@ -286,12 +294,8 @@ impl VoxCPMGenerator {
             cond_type,
         )?;
 
-        let cfg_dtype = config.dtype.as_str();
-        let m_dtype = if options.quant.is_enabled() {
-            get_quant_compute_dtype(dtype, cfg_dtype, &device)
-        } else {
-            get_compute_dtype(dtype, cfg_dtype, &device)
-        };
+        let m_dtype =
+            resolve_model_dtype(options.quant.is_enabled(), config.dtype.as_str(), &device);
 
         // Load main model weights (. bin or .safetensors)
         let model_list = find_type_files(path, "bin")?;
@@ -549,7 +553,7 @@ mod tests {
         assert_eq!(cfg.stop_check_interval, 1);
         assert!((cfg.retry_badcase_ratio_threshold - 6.0).abs() < 1e-9);
         assert_eq!(cfg.stream_decode_initial_latent_batch, 4);
-        assert_eq!(cfg.stream_decode_latent_batch, 8);
+        assert_eq!(cfg.stream_decode_latent_batch, 12);
         assert_eq!(cfg.inference_timesteps, 10);
         assert!((cfg.cfg_full_fraction - 1.0).abs() < 1e-9);
     }

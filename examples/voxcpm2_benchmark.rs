@@ -64,12 +64,6 @@ struct Args {
     #[arg(long, default_value = "false")]
     quant_quality_first: bool,
 
-    #[arg(long, default_value = "auto")]
-    dtype: String,
-
-    #[arg(long, default_value = "auto")]
-    vae_dtype: String,
-
     #[arg(long)]
     device_id: Option<usize>,
 
@@ -457,8 +451,6 @@ fn build_options(
 ) -> VoxCPMGeneratorOptions {
     let mut options = VoxCPMGeneratorOptions::default();
     options.device_id = args.device_id;
-    options.dtype = voxcpm_rs::utils::device::parse_dtype_option(Some(&args.dtype));
-    options.vae_dtype = voxcpm_rs::utils::device::parse_dtype_option(Some(&args.vae_dtype));
     options.quant = if args.quant_quality_first && quant_weight.is_enabled() {
         VoxCPMQuantConfig::quality_first(quant_weight)
     } else {

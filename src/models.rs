@@ -783,7 +783,11 @@ impl VoxCPMLocEnc {
 
     pub fn forward(&mut self, x: &Tensor) -> Result<Tensor> {
         let (b, t, _, _) = x.dims4()?;
-        let x = self.in_proj.forward(x)?;
+        // Prefill passes a non-contiguous view (e.g. stride [4,4,1,136] for [1,34,4,64]).
+        // The F32 Metal matmul kernel rejects strided views; materialize once here
+        // (prefill-only cost, no-op when already contiguous).
+        let x = x.contiguous()?;
+        let x = self.in_proj.forward(&x)?;
         let special_tokens = self.special_token.expand((b, t, 1, self.hidden_size))?;
         let x = Tensor::cat(&[&special_tokens, &x], 2)?;
         let (b, t, p, c) = x.dims4()?;

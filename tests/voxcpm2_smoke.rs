@@ -15,7 +15,7 @@ fn voxcpm2_load_and_short_generate() -> anyhow::Result<()> {
     let model_path =
         std::env::var("VOXCPM2_MODEL_PATH").unwrap_or_else(|_| "models/VoxCPM2".to_string());
     let load_start = Instant::now();
-    let mut generator = VoxCPMGenerator::new(&model_path, None, None)?;
+    let mut generator = VoxCPMGenerator::new(&model_path, None)?;
     let load_secs = load_start.elapsed().as_secs_f64();
     assert_eq!(generator.model_name(), "VoxCPM2");
     assert_eq!(generator.sample_rate(), 48_000);
@@ -72,7 +72,7 @@ fn voxcpm2_load_and_short_generate() -> anyhow::Result<()> {
 fn voxcpm2_stream_short_generate() -> anyhow::Result<()> {
     let model_path =
         std::env::var("VOXCPM2_MODEL_PATH").unwrap_or_else(|_| "models/VoxCPM2".to_string());
-    let mut generator = VoxCPMGenerator::new(&model_path, None, None)?;
+    let mut generator = VoxCPMGenerator::new(&model_path, None)?;
     let text = "VoxCPM2 streaming smoke.".to_string();
     let start = Instant::now();
     let mut first_chunk = None;

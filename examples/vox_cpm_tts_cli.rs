@@ -7,8 +7,8 @@ use std::path::PathBuf;
 use std::time::Instant;
 use voxcpm_rs::{
     audio_quality_ok, compare_fp_enabled, compare_fp_min_correlation, pcm_correlation,
-    utils::device::parse_dtype_option, VoxCPMGenerationConfig, VoxCPMGenerator,
-    VoxCPMGeneratorOptions, VoxCPMQuantConfig, VoxCPMWeightQuant, COMPARE_FP_DEFAULT_SEED,
+    VoxCPMGenerationConfig, VoxCPMGenerator, VoxCPMGeneratorOptions, VoxCPMQuantConfig,
+    VoxCPMWeightQuant, COMPARE_FP_DEFAULT_SEED,
 };
 
 #[derive(Parser, Debug)]
@@ -46,14 +46,6 @@ struct Args {
     #[arg(long, default_value = "none")]
     quant: String,
 
-    /// Compute dtype: auto|f32|f16|bf16
-    #[arg(long, default_value = "auto")]
-    dtype: String,
-
-    /// VAE dtype: auto|f32|f16|bf16
-    #[arg(long, default_value = "auto")]
-    vae_dtype: String,
-
     /// GPU device ordinal (CUDA/Metal)
     #[arg(long)]
     device_id: Option<usize>,
@@ -86,8 +78,6 @@ fn main() -> Result<()> {
 
     let mut options = VoxCPMGeneratorOptions::default();
     options.device_id = args.device_id;
-    options.dtype = parse_dtype_option(Some(&args.dtype));
-    options.vae_dtype = parse_dtype_option(Some(&args.vae_dtype));
     options.quant = VoxCPMQuantConfig::with_weight(quant_weight);
     options.seed = compare_seed;
 
@@ -310,8 +300,6 @@ fn build_options(
 ) -> VoxCPMGeneratorOptions {
     let mut options = VoxCPMGeneratorOptions::default();
     options.device_id = args.device_id;
-    options.dtype = parse_dtype_option(Some(&args.dtype));
-    options.vae_dtype = parse_dtype_option(Some(&args.vae_dtype));
     options.quant = VoxCPMQuantConfig::with_weight(quant);
     options.seed = seed;
     options

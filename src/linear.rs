@@ -68,7 +68,11 @@ pub enum LinearX {
 impl Module for LinearX {
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         match self {
-            Self::Linear(ln) => ln.forward(x),
+            Self::Linear(ln) => {
+                // Metal F32 gemm rejects strided views (prefill feeds permuted/sliced
+                // tensors); materialize non-contiguous inputs. No-op when contiguous.
+                ln.forward(&x.contiguous()?)
+            }
             Self::QLinear(ln) => ln.forward(x),
         }
     }

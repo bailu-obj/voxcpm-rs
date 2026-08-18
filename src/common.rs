@@ -529,6 +529,18 @@ fn eager_attention_inner(
     {
         let query_states = query_states.contiguous()?;
         let key_transposed = key_states.transpose(D::Minus2, D::Minus1)?;
+        if std::env::var_os("VOXCPM_DEBUG_ATTN").is_some() {
+            eprintln!(
+                "VOXCPM_DEBUG_ATTN q={:?}s{:?} kT={:?}s{:?} v={:?}s{:?} mask={}",
+                query_states.shape(),
+                query_states.stride(),
+                key_transposed.shape(),
+                key_transposed.stride(),
+                value_states.shape(),
+                value_states.stride(),
+                attention_mask.is_some()
+            );
+        }
         let mut attn_weights = query_states.matmul(&key_transposed)?.affine(scaling, 0.0)?;
 
         if let Some(mask) = attention_mask {

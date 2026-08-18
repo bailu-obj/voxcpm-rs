@@ -79,10 +79,10 @@ RTF / TTFA benchmark (VoxCPM2 streaming, official full CFG):
 ```bash
 cargo run --release -p voxcpm-rs --features metal --example voxcpm2_benchmark -- \
   --model models/VoxCPM2 --stream \
-  --quant q8_0 --dtype f16 --cfg-full-fraction 1.0 \
+  --quant q8_0 --cfg-full-fraction 1.0 \
   --inference-timesteps 10 \
   --stream-decode-initial-latent-batch 4 \
-  --stream-decode-latent-batch 8 \
+  --stream-decode-latent-batch 12 \
   --stop-check-interval 1 --min-len 2 \
   --ref-wav models/paimon_01.wav \
   --ref-text "Reference transcript matching the clip." \
@@ -137,12 +137,10 @@ for chunk in gen.generate_pcm_stream_with_config("Hello.".into(), config)? {
 |-------|-------------|
 | `device` | Explicit Candle `Device` (overrides auto-detect) |
 | `device_id` | GPU ordinal when auto-detecting CUDA/Metal |
-| `dtype` | Main compute dtype override (`F16`, `BF16`, `F32`, …) |
-| `vae_dtype` | Audio VAE compute dtype override |
 | `quant` | `VoxCPMQuantConfig` (weight mode + skip patterns) |
 | `seed` | Fixed RNG seed for reproducible GPU generation |
 
-When `dtype` / `vae_dtype` are unset (`auto`), the loader picks lower precision on GPU for **non-quant** runs (typically `F16` for the LM). When **quant is enabled** and `dtype=auto`, activations default to **F32** to match `QMatMul` and avoid per-layer cast churn.
+Compute dtype is resolved internally (no user-facing option): **quantized runs use F32 activations** — `QMatMul` accumulates in F32, so half-precision activations only add per-layer cast kernels (measured ~3% RTF slower on Apple Silicon) — while dense runs (`quant=none`) keep the checkpoint's half precision (BF16) so weight streaming stays cheap. Use `q8_0` for throughput.
 
 ### Generation presets (`VoxCPMGenerationConfig`)
 
@@ -188,7 +186,7 @@ Programmatic stats: `generator.quant_stats()` after `new_with_options`.
 
 ### Dtype with quant
 
-When quant is enabled and `dtype=auto`, activations default to **F32** (see `get_quant_compute_dtype` in `utils/device.rs`).
+Quantized runs compute with **F32 activations** (matching `QMatMul`'s F32 accumulation; no cast churn). Dense runs load the checkpoint dtype (BF16).
 
 ```rust
 use voxcpm_rs::{VoxCPMQuantConfig, VoxCPMWeightQuant};
@@ -222,15 +220,16 @@ Measured on **Mac mini M4 Pro (Apple M4 Pro, 64 GB)**, 2026-08-19. Numbers vary 
 | `none` | ~0.5 s | ~0.70 | — |
 | `q8_0` | ~1.2 s | ~0.69 | gate-checked via `--compare-fp` |
 
-**VoxCPM2** streaming voice-clone (steps **10**, `cfg_full_fraction=1.0`, init/latent/stop **4/8/1**, medium Chinese utterance ~4 s audio; seed 42, median of 5):
+**VoxCPM2** streaming voice-clone (steps **10**, `cfg_full_fraction=1.0`, init/latent/stop **4/12/1**, medium Chinese utterance ~4 s audio; seed 42, median of 5):
 
 | Build | RTF | TTFA | Notes |
 |-------|----:|-----:|-------|
 | Eager (`VOXCPM_FUSED_SDPA=0 VOXCPM_FUSE_PROJ=0 VOXCPM_FUSED_ROPE=0`, q8_0+f16) | 1.18 | 0.98 s | 432 quantized matrices |
-| FP reference (none/auto) | 1.08 | 0.88 s | |
-| **Current defaults** (fused proj + RoPE + GQA, q8_0+f16) | **0.98** | **0.85 s** | 252 quantized matrices; corr 0.990 vs FP |
+| FP reference (dense BF16 weights) | ~1.04 | ~0.84 s | baseline only; checkpoint dtype |
+| q8_0 + explicit f16 (historical) | 0.98 | 0.85 s | F16 acts added per-matmul cast churn |
+| **Current defaults** (fused proj + RoPE + GQA, q8_0 → F32 acts, VAE batches 4→12) | **0.84–0.95** | **0.76–0.85 s** | 252 quantized matrices; f16-vs-f32 outputs corr 0.9987; long-line RTF 0.80 |
 
-Stage split via `--profile` (`cfm`, `lm`, `vae`, `VOXCPM_BOTTLENECK_HINT`). On M4 Pro the every-latent stop head is the dominant stage (~38%), ahead of CFM/DiT (~32%).
+> Fixed (2026-08-19): prefill fed strided tensor views (e.g. stride `[4,4,1,136]` for a `[1,34,4,64]` input) into the F32 Metal gemm, which rejects non-contiguous layouts (`Invalid matmul arguments …`) — the old F16 kernel happened to tolerate them. Non-contiguous inputs are now materialized (`VoxCPMLocEnc::forward`, `LinearX::forward`). Stage split via `--profile` (`cfm`, `lm`, `vae`, `VOXCPM_BOTTLENECK_HINT`) — note unsynced stage timers attribute GPU-drain wait to the first host-readback stage (the stop head at `interval=1`); true synced split is CFM/DiT 61% · VAE 26% · LM 13% · stop 0.3%.
 
 ### Benchmarking
 
