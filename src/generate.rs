@@ -14,8 +14,9 @@ use crate::{
 
 const DEFAULT_INFERENCE_TIMESTEPS: usize = 10;
 pub const DEFAULT_STREAM_DECODE_LATENT_BATCH: usize = 12;
-/// Bailu/OpenBMB quality default: first streaming VAE decode batch (TTFA).
-pub const DEFAULT_STREAM_DECODE_INITIAL_LATENT_BATCH: usize = 4;
+/// Bailu quality default: first streaming VAE decode batch, matched to the
+/// steady-state batch (larger first decode, ~320 ms more TTFA than batch 4).
+pub const DEFAULT_STREAM_DECODE_INITIAL_LATENT_BATCH: usize = 12;
 /// Quality default: check stop head every latent (matches OpenBMB VoxCPM2).
 const DEFAULT_STOP_CHECK_INTERVAL: usize = 1;
 const DEFAULT_MIN_LEN: usize = 2;
@@ -552,7 +553,7 @@ mod tests {
         assert_eq!(cfg.min_len, 2);
         assert_eq!(cfg.stop_check_interval, 1);
         assert!((cfg.retry_badcase_ratio_threshold - 6.0).abs() < 1e-9);
-        assert_eq!(cfg.stream_decode_initial_latent_batch, 4);
+        assert_eq!(cfg.stream_decode_initial_latent_batch, 12);
         assert_eq!(cfg.stream_decode_latent_batch, 12);
         assert_eq!(cfg.inference_timesteps, 10);
         assert!((cfg.cfg_full_fraction - 1.0).abs() < 1e-9);

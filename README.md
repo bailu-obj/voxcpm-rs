@@ -81,7 +81,7 @@ cargo run --release -p voxcpm-rs --features metal --example voxcpm2_benchmark --
   --model models/VoxCPM2 --stream \
   --quant q8_0 --cfg-full-fraction 1.0 \
   --inference-timesteps 10 \
-  --stream-decode-initial-latent-batch 4 \
+  --stream-decode-initial-latent-batch 12 \
   --stream-decode-latent-batch 12 \
   --stop-check-interval 1 --min-len 2 \
   --ref-wav models/paimon_01.wav \
@@ -151,7 +151,7 @@ Compute dtype is resolved internally (no user-facing option): **quantized runs u
 | `low_latency()` | Smaller VAE batches, fewer stop checks |
 | `metal_rtf()` | Metal throughput tuning |
 
-Default `voice_clone()` / `Default` (balanced preset): `inference_timesteps=10`, `cfg_value=2.0`, `cfg_full_fraction=1.0`, `min_len=2`, `max_len=500`, `retry_badcase_ratio_threshold=6.0`, `stream_decode_initial_latent_batch=4`, `stream_decode_latent_batch=8`, `stop_check_interval=1`. (`retry_badcase` only scales the latent budget in this port — it does not retry seeds.) After generation, `VoxCPMGenerator::last_diagnostics()` reports `stop_reason` (`stop_head` | `max_len`), latent count, and effective max length.
+Default `voice_clone()` / `Default` (balanced preset): `inference_timesteps=10`, `cfg_value=2.0`, `cfg_full_fraction=1.0`, `min_len=2`, `max_len=500`, `retry_badcase_ratio_threshold=6.0`, `stream_decode_initial_latent_batch=12`, `stream_decode_latent_batch=12`, `stop_check_interval=1`. (`retry_badcase` only scales the latent budget in this port — it does not retry seeds.) After generation, `VoxCPMGenerator::last_diagnostics()` reports `stop_reason` (`stop_head` | `max_len`), latent count, and effective max length.
 
 ## Weight quantization
 
