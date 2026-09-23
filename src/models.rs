@@ -1,5 +1,5 @@
 use anyhow::Result;
-use candle_core::{DType, Device, IndexOp, Tensor, D};
+use candle_core::{D, DType, Device, IndexOp, Tensor};
 use candle_nn::{Module, VarBuilder};
 use std::{
     cmp::max,
@@ -11,9 +11,9 @@ use crate::{
     audio_vae::AudioVAE,
     config::{CfmConfig, VoxCPMConfig, VoxMiniCPM4Config},
     generate::{VoxCPMGenerationConfig, VoxCPMGenerationDiagnostics, VoxCPMStopReason},
-    linear::{linear_x, LinearX},
+    linear::{LinearX, linear_x},
     minicpm4::MiniCPMModel,
-    profile::{profile_stream_enabled, stage_capture_enabled, InferenceStepProfile, StageProfile},
+    profile::{InferenceStepProfile, StageProfile, profile_stream_enabled, stage_capture_enabled},
     quant::{QuantBuildCtx, QuantStats, VoxCPMQuantConfig},
     tokenizer::SingleChineseTokenizer,
     utils::audio::load_audio_with_resample,
@@ -1013,15 +1013,46 @@ impl VoxCPMModel {
 
     fn preprocess_audio_to_feat(&self, wav_path: &str) -> Result<Tensor> {
         let mut audio = load_audio_with_resample(wav_path, &self.device, Some(self.sample_rate))?;
+        self.pcm_shape_to_prompt_feat(&mut audio)
+    }
+
+    /// Tail of [`Self::preprocess_audio_to_feat`]: pad a `(1, N)` PCM-shaped
+    /// tensor to the patch grid, VAE-encode it, and reshape into the
+    /// `(T, patch_size, latent_dim)` prompt-feature layout that
+    /// [`Self::prepare_full_inputs`] expects from a prompt cache.
+    fn pcm_shape_to_prompt_feat(&self, audio: &mut Tensor) -> Result<Tensor> {
         let patch_len = self.patch_size * self.chunk_size;
         if audio.dim(1)? % patch_len != 0 {
-            audio = audio.pad_with_zeros(D::Minus1, patch_len - audio.dim(1)? % patch_len, 0)?;
+            *audio = audio.pad_with_zeros(D::Minus1, patch_len - audio.dim(1)? % patch_len, 0)?;
         }
-        let audio_feat = self.audio_vae.encode(&audio, Some(self.sample_rate))?;
+        let audio_feat = self.audio_vae.encode(audio, Some(self.sample_rate))?;
         let audio_feat = audio_feat
             .reshape((self.audio_vae.latent_dim, (), self.patch_size))?
             .permute((1, 2, 0))?;
         Ok(audio_feat)
+    }
+
+    /// Build a prompt cache from in-memory i16 PCM instead of a WAV file:
+    /// the caller feeds back the trailing audio of what was just
+    /// synthesized, so the next segment continues the same utterance
+    /// (streaming-prefix reuse; no disk round-trip).
+    pub fn build_prompt_cache_from_pcm(
+        &mut self,
+        prompt_text: String,
+        prompt_pcm: &[i16],
+    ) -> Result<HashMap<String, Tensor>> {
+        let pcm_f32: Vec<f32> = prompt_pcm.iter().map(|&s| f32::from(s) / 32768.0).collect();
+        let audio = Tensor::from_slice(&pcm_f32, pcm_f32.len(), &self.device)?.unsqueeze(0)?;
+        let text_token = self.tokenizer.encode(prompt_text)?;
+        let text_token = Tensor::from_slice(&text_token, text_token.len(), &self.device)?;
+        let mut audio = audio;
+        let audio_feat = self
+            .pcm_shape_to_prompt_feat(&mut audio)?
+            .to_dtype(self.dtype)?;
+        let mut hashmap = HashMap::new();
+        hashmap.insert("text_token".to_string(), text_token);
+        hashmap.insert("audio_feat".to_string(), audio_feat);
+        Ok(hashmap)
     }
 
     fn prepare_full_inputs(

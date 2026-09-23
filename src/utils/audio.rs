@@ -1,5 +1,5 @@
-use anyhow::{anyhow, Result};
-use candle_core::{Device, Tensor, D};
+use anyhow::{Result, anyhow};
+use candle_core::{D, Device, Tensor};
 use candle_nn::{Conv1d, Conv1dConfig, Module};
 use num::integer::gcd;
 use std::io::Cursor;

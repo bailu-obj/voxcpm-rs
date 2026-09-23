@@ -18,17 +18,17 @@ pub mod utils;
 
 pub use config::{AudioVaeConfig, VoxCPMConfig};
 pub use generate::{
-    VoxCPMGenerationConfig, VoxCPMGenerationDiagnostics, VoxCPMGenerator, VoxCPMGeneratorOptions,
-    VoxCPMStopReason, COMPARE_FP_DEFAULT_SEED, DEFAULT_STREAM_DECODE_INITIAL_LATENT_BATCH,
-    DEFAULT_STREAM_DECODE_LATENT_BATCH,
+    COMPARE_FP_DEFAULT_SEED, DEFAULT_STREAM_DECODE_INITIAL_LATENT_BATCH,
+    DEFAULT_STREAM_DECODE_LATENT_BATCH, VoxCPMGenerationConfig, VoxCPMGenerationDiagnostics,
+    VoxCPMGenerator, VoxCPMGeneratorOptions, VoxCPMStopReason, VoxCPMStreamContext,
 };
 pub use profile::{
+    BenchmarkMetrics, COMPARE_FP_MIN_CORRELATION, InferenceStepProfile, StageProfile,
     audio_quality_ok, bench_profile_enabled, bottleneck_hint, compare_fp_enabled,
     compare_fp_min_correlation, pcm_correlation, reset_stage_profile, take_stage_profile,
-    BenchmarkMetrics, InferenceStepProfile, StageProfile, COMPARE_FP_MIN_CORRELATION,
 };
 pub use quant::{
-    quant_audit_enabled, QuantBuildCtx, QuantStats, VoxCPMQuantConfig, VoxCPMWeightQuant,
+    QuantBuildCtx, QuantStats, VoxCPMQuantConfig, VoxCPMWeightQuant, quant_audit_enabled,
 };
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -1,5 +1,5 @@
 use anyhow::{Ok, Result};
-use candle_core::{pickle::read_all_with_key, DType, Device, DeviceLocation, Tensor};
+use candle_core::{DType, Device, DeviceLocation, Tensor, pickle::read_all_with_key};
 use candle_nn::VarBuilder;
 use std::collections::HashMap;
 
@@ -195,6 +195,34 @@ pub struct VoxCPMGenerator {
     sample_rate: usize,
     model_name: String,
     generation_seed: Option<u64>,
+}
+
+/// How much trailing audio the stream context keeps as the next segment's
+/// prompt conditioning (seconds).
+const STREAM_CONTEXT_TAIL_SECS: usize = 4;
+
+/// Per-reply continuation state for streaming synthesis: the transcript and
+/// trailing audio of the segment that was just synthesized, re-fed as the
+/// prompt conditioning of the next segment of the same reply (the
+/// streaming-prefix principle: the utterance continues instead of restarting
+/// from silence, and already-synthesized audio is never redone — it is
+/// reused as context).
+#[derive(Default)]
+pub struct VoxCPMStreamContext {
+    prompt_cache: Option<HashMap<String, Tensor>>,
+}
+
+impl VoxCPMStreamContext {
+    #[must_use]
+    pub fn new() -> Self {
+        Self { prompt_cache: None }
+    }
+
+    /// True once a segment has been fed back; the next call continues it.
+    #[must_use]
+    pub fn is_continued(&self) -> bool {
+        self.prompt_cache.is_some()
+    }
 }
 
 /// Resolve main-model load dtype (no user-facing option).
@@ -474,6 +502,59 @@ impl VoxCPMGenerator {
             inner: stream,
             normalizer: PcmNormalizerSlot::Shared(normalizer),
         }))
+    }
+
+    /// Streaming PCM generation continuing a caller-owned
+    /// [`VoxCPMStreamContext`]: the first segment runs cold; later segments
+    /// condition on the tail fed back via [`Self::update_stream_context`],
+    /// so speaker and prosody carry across segment boundaries instead of
+    /// restarting the utterance from silence.
+    pub fn generate_pcm_stream_continue<'a>(
+        &'a mut self,
+        target_text: String,
+        config: VoxCPMGenerationConfig,
+        normalizer: &'a mut crate::utils::audio::StreamPcmNormalizer,
+        ctx: &'a VoxCPMStreamContext,
+    ) -> Result<Box<dyn Iterator<Item = Result<Vec<i16>>> + 'a>> {
+        let stream: Box<dyn Iterator<Item = Result<Tensor>> + '_> = if let Some(cache) =
+            ctx.prompt_cache.as_ref()
+        {
+            Box::new(
+                self.voxcpm
+                    .generate_stream_with_prompt_cache(target_text, cache, config)?,
+            )
+        } else {
+            Box::new(
+                self.voxcpm
+                    .generate_stream(target_text, None, None, config)?,
+            )
+        };
+        Ok(Box::new(PcmStreamIter {
+            inner: stream,
+            normalizer: PcmNormalizerSlot::Shared(normalizer),
+        }))
+    }
+
+    /// Feed one finished segment back into the context: its transcript and
+    /// trailing PCM become the next segment's prompt conditioning. Only the
+    /// last [`STREAM_CONTEXT_TAIL_SECS`] seconds are kept, so conditioning
+    /// cost stays flat however long the reply grows.
+    pub fn update_stream_context(
+        &mut self,
+        ctx: &mut VoxCPMStreamContext,
+        segment_text: &str,
+        segment_pcm: &[i16],
+    ) -> Result<()> {
+        if segment_pcm.is_empty() {
+            return Ok(());
+        }
+        let tail = STREAM_CONTEXT_TAIL_SECS * self.sample_rate;
+        let start = segment_pcm.len().saturating_sub(tail);
+        ctx.prompt_cache = Some(
+            self.voxcpm
+                .build_prompt_cache_from_pcm(segment_text.to_string(), &segment_pcm[start..])?,
+        );
+        Ok(())
     }
 
     /// Get sample rate

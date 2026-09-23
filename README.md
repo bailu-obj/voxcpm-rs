@@ -129,6 +129,47 @@ for chunk in gen.generate_pcm_stream_with_config("Hello.".into(), config)? {
 }
 ```
 
+### Continuation across segments (`VoxCPMStreamContext`)
+
+Long replies are synthesized segment by segment. A `VoxCPMStreamContext` turns
+those segments into one continuing utterance instead of independent cold
+starts: after a segment finishes, feed its PCM back with
+`update_stream_context`; the next `generate_pcm_stream_continue` call
+conditions on the trailing audio (bounded to the last 4 seconds) and the
+segment transcript, so speaker and prosody carry across boundaries — the
+streaming-prefix principle applied across calls. The first segment runs cold,
+and already-synthesized audio is reused as context, never re-synthesized.
+
+```rust
+use voxcpm_rs::VoxCPMStreamContext;
+
+let mut ctx = VoxCPMStreamContext::new();
+let mut normalizer = voxcpm_rs::utils::audio::StreamPcmNormalizer::new();
+for segment in ["第一句比较长，说完自然停顿。", "第二句接着说下去。"] {
+    let mut pcm_all: Vec<i16> = Vec::new();
+    for chunk in gen.generate_pcm_stream_continue(
+        segment.into(),
+        VoxCPMGenerationConfig::simple(),
+        &mut normalizer,
+        &ctx,
+    )? {
+        pcm_all.extend_from_slice(&chunk?);
+    }
+    // Iterator fully consumed here — safe to borrow the generator again.
+    gen.update_stream_context(&mut ctx, segment, &pcm_all)?;
+}
+```
+
+Notes:
+
+- `update_stream_context` must run only after the stream iterator is fully
+  dropped (it re-encodes the tail through the VAE on the same generator).
+- The prompt features are rebuilt in memory (`build_prompt_cache_from_pcm` on
+  `VoxCPMModel`) — no WAV disk round-trip.
+- Sharing one `StreamPcmNormalizer` across the calls (as above) additionally
+  keeps PCM gain continuous; the context replaces nothing about the
+  normalizer, they compose.
+
 ## Configuration
 
 ### Load-time options (`VoxCPMGeneratorOptions`)
@@ -305,6 +346,7 @@ Default features are empty; pick one GPU backend at build time for examples and 
 Re-exported from the crate root:
 
 - `VoxCPMGenerator`, `VoxCPMGeneratorOptions`, `VoxCPMGenerationConfig`
+- `VoxCPMStreamContext` (cross-segment continuation: `generate_pcm_stream_continue`, `update_stream_context`)
 - `VoxCPMConfig`, `AudioVaeConfig`
 - `VoxCPMQuantConfig`, `VoxCPMWeightQuant`, `QuantStats`
 - `audio_quality_ok`, `pcm_correlation`, `compare_fp_min_correlation`

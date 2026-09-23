@@ -1,5 +1,5 @@
 use anyhow::Result;
-use candle_core::{DType, Tensor, D};
+use candle_core::{D, DType, Tensor};
 
 #[inline]
 pub fn compute_default_rope_parameters(dim: usize, base: f32) -> Vec<f32> {

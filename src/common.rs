@@ -1,11 +1,11 @@
 use anyhow::Result;
 #[cfg(feature = "metal")]
 use candle_core::DeviceLocation;
-use candle_core::{DType, Tensor, D};
+use candle_core::{D, DType, Tensor};
 use candle_nn::{Activation, Module, VarBuilder};
 
 use crate::kv_cache::KvCache;
-use crate::linear::{fused_linear_x, linear_x, FusedLinearX, LinearX};
+use crate::linear::{FusedLinearX, LinearX, fused_linear_x, linear_x};
 use crate::position_embed::rope::apply_rotary_pos_emb;
 use crate::quant::QuantBuildCtx;
 use crate::utils::tensor::repeat_kv;

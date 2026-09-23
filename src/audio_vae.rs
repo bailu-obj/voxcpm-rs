@@ -1,8 +1,8 @@
-use anyhow::{anyhow, Ok, Result};
-use candle_core::{DType, Device, Tensor, D};
+use anyhow::{Ok, Result, anyhow};
+use candle_core::{D, DType, Device, Tensor};
 use candle_nn::{
-    embedding, Conv1d, Conv1dConfig, ConvTranspose1d, ConvTranspose1dConfig, Embedding, Module,
-    VarBuilder,
+    Conv1d, Conv1dConfig, ConvTranspose1d, ConvTranspose1dConfig, Embedding, Module, VarBuilder,
+    embedding,
 };
 
 use crate::utils::bucketize;

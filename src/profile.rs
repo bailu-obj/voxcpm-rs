@@ -395,11 +395,7 @@ pub fn pcm_correlation(a: &[i16], b: &[i16]) -> f64 {
         var_b += db * db;
     }
     let denom = (var_a * var_b).sqrt();
-    if denom < 1e-12 {
-        0.0
-    } else {
-        cov / denom
-    }
+    if denom < 1e-12 { 0.0 } else { cov / denom }
 }
 
 #[cfg(test)]

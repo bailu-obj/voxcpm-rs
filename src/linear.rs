@@ -3,9 +3,9 @@
 use anyhow::Result;
 use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
 use candle_core::{DType, Device, Module, Tensor};
-use candle_nn::{linear, linear_no_bias, Linear, VarBuilder};
+use candle_nn::{Linear, VarBuilder, linear, linear_no_bias};
 
-use crate::quant::{quant_audit_enabled, quant_audit_log, QuantBuildCtx, VoxCPMWeightQuant};
+use crate::quant::{QuantBuildCtx, VoxCPMWeightQuant, quant_audit_enabled, quant_audit_log};
 
 /// Resolved GGUF dtype for a weight matrix, including K-quant → Q8_0 fallback.
 pub struct ResolvedGgmlDtype {

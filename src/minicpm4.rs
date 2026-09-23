@@ -1,6 +1,6 @@
-use anyhow::{anyhow, Ok, Result};
+use anyhow::{Ok, Result, anyhow};
 use candle_core::{DType, Device, Tensor};
-use candle_nn::{embedding, rms_norm, Embedding, Module, RmsNorm, VarBuilder};
+use candle_nn::{Embedding, Module, RmsNorm, VarBuilder, embedding, rms_norm};
 
 use crate::{
     common::{GateUpDownMLP, NaiveAttention},
