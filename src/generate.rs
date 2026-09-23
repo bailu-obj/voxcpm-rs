@@ -230,14 +230,22 @@ impl VoxCPMStreamContext {
 /// Quant path: **F32 activations** — `QMatMul` accumulates in F32, so half-precision
 /// activations only add per-layer cast churn (measured ~3% RTF slower on Apple Silicon).
 /// Dense path (`quant=none`): keep the checkpoint dtype (BF16 for current VoxCPM
-/// checkpoints); F32-declaring configs downcast to F16 on GPU (weight-stream-bound at
-/// decode batch sizes).
+/// checkpoints), except on Metal where BF16 matmul kernels are absent — BF16
+/// checkpoints downcast to F16 at load (same half class, richer mantissa) so the
+/// dense path and the FP-reference tests stay runnable there; F32-declaring configs
+/// downcast to F16 on GPU (weight-stream-bound at decode batch sizes).
 fn resolve_model_dtype(quant_enabled: bool, cfg_dtype: &str, device: &Device) -> DType {
     if quant_enabled {
         return DType::F32;
     }
     match cfg_dtype.trim().to_lowercase().as_str() {
-        "bfloat16" | "bf16" => DType::BF16,
+        "bfloat16" | "bf16" => match device.location() {
+            // Metal has no BF16 matmul kernels in this candle build;
+            // BF16 checkpoints downcast to F16 at load (same half class,
+            // richer mantissa) so the dense path stays runnable there.
+            DeviceLocation::Metal { .. } => DType::F16,
+            _ => DType::BF16,
+        },
         "float16" | "half" | "f16" => DType::F16,
         _ => match device.location() {
             DeviceLocation::Cpu => DType::F32,

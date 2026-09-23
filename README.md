@@ -227,7 +227,7 @@ Programmatic stats: `generator.quant_stats()` after `new_with_options`.
 
 ### Dtype with quant
 
-Quantized runs compute with **F32 activations** (matching `QMatMul`'s F32 accumulation; no cast churn). Dense runs load the checkpoint dtype (BF16).
+Quantized runs compute with **F32 activations** (matching `QMatMul`'s F32 accumulation; no cast churn). Dense runs load the checkpoint dtype (BF16), except on **Metal** where BF16 matmul kernels are absent: BF16 checkpoints downcast to **F16** at load so the dense path (and the FP-reference GPU tests) stay runnable. Warmed steady state on M4 Pro with VoxCPM2 (3-run median): dense F16 RTF 0.81 batch / 0.85 stream vs q8_0 production 0.70 (~15% apart — weights are mmap'd and stay resident in unified memory). A **cold first run** is much slower (observed RTF 2.1): the 8.1 GB dense weights upload on first touch plus one-time Metal F16 kernel JIT; q8_0's 2 GB footprint cold-starts correspondingly cheaper. Stream-vs-batch PCM correlation 0.9998.
 
 ```rust
 use voxcpm_rs::{VoxCPMQuantConfig, VoxCPMWeightQuant};
@@ -361,7 +361,7 @@ Unit tests run on CPU without model files:
 cargo test -p voxcpm-rs
 ```
 
-Doc tests and GPU examples require downloaded weights and a GPU build; exclude this crate (`--exclude voxcpm-rs`) in CI smoke tests without a GPU.
+Doc tests and GPU examples require downloaded weights and a GPU build; exclude this crate (`--exclude voxcpm-rs`) in CI smoke tests without a GPU. The ignored GPU tests (`-- --ignored --nocapture`, `VOXCPM2_MODEL_PATH=...`) run dense-F16 on Metal via the load-time downcast: `voxcpm2_smoke` (3 tests) and `stream_batch_parity` pass on Apple Silicon with correlation ≥ 0.9996.
 
 ## Acknowledgments
 
