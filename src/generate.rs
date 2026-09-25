@@ -513,10 +513,12 @@ impl VoxCPMGenerator {
     }
 
     /// Streaming PCM generation continuing a caller-owned
-    /// [`VoxCPMStreamContext`]: the first segment runs cold; later segments
-    /// condition on the tail fed back via [`Self::update_stream_context`],
-    /// so speaker and prosody carry across segment boundaries instead of
-    /// restarting the utterance from silence.
+    /// [`VoxCPMStreamContext`].
+    ///
+    /// A clone prompt built by [`Self::build_prompt_cache`] is the voice for
+    /// every segment, including ones after the first. Only when there is no
+    /// reference audio do later segments condition on the tail fed back via
+    /// [`Self::update_stream_context`].
     pub fn generate_pcm_stream_continue<'a>(
         &'a mut self,
         target_text: String,
@@ -524,9 +526,15 @@ impl VoxCPMGenerator {
         normalizer: &'a mut crate::utils::audio::StreamPcmNormalizer,
         ctx: &'a VoxCPMStreamContext,
     ) -> Result<Box<dyn Iterator<Item = Result<Vec<i16>>> + 'a>> {
+        self.apply_generation_seed()?;
         let stream: Box<dyn Iterator<Item = Result<Tensor>> + '_> = if let Some(cache) =
-            ctx.prompt_cache.as_ref()
+            self.prompt_cache.as_ref()
         {
+            Box::new(
+                self.voxcpm
+                    .generate_stream_with_prompt_cache(target_text, cache, config)?,
+            )
+        } else if let Some(cache) = ctx.prompt_cache.as_ref() {
             Box::new(
                 self.voxcpm
                     .generate_stream_with_prompt_cache(target_text, cache, config)?,
@@ -547,13 +555,16 @@ impl VoxCPMGenerator {
     /// trailing PCM become the next segment's prompt conditioning. Only the
     /// last [`STREAM_CONTEXT_TAIL_SECS`] seconds are kept, so conditioning
     /// cost stays flat however long the reply grows.
+    ///
+    /// A reference-audio prompt cache is left in place. Following segments
+    /// keep cloning from that audio instead of switching to the generated tail.
     pub fn update_stream_context(
         &mut self,
         ctx: &mut VoxCPMStreamContext,
         segment_text: &str,
         segment_pcm: &[i16],
     ) -> Result<()> {
-        if segment_pcm.is_empty() {
+        if self.prompt_cache.is_some() || segment_pcm.is_empty() {
             return Ok(());
         }
         let tail = STREAM_CONTEXT_TAIL_SECS * self.sample_rate;

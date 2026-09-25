@@ -1075,6 +1075,53 @@ impl VoxCPMModel {
             let target_text_token = self.tokenizer.encode(target_text.clone())?;
             let target_text_token =
                 Tensor::from_slice(&target_text_token, target_text_token.len(), &self.device)?;
+            let (audio_length, cached_feat) = match cache.get("audio_feat") {
+                Some(feat) => (feat.dim(0)?, Some(feat.clone())),
+                None => (0, None),
+            };
+            if self.config.is_voxcpm2() && audio_length > 0 {
+                // Reference audio belongs in the ref-token span before the
+                // target text. Placing the cache after the text makes VoxCPM2
+                // treat it as continuation padding, so the spoken output never
+                // conditions on the clip.
+                let feat = cached_feat.unwrap().to_dtype(self.dtype)?;
+                let audio_start = Tensor::new(vec![self.audio_start_token as u32], &self.device)?;
+                let mut target_token = Tensor::cat(&[target_text_token, audio_start], D::Minus1)?;
+                let target_len = target_token.dim(0)?;
+                let ref_start = Tensor::new(vec![self.ref_audio_start_token], &self.device)?;
+                let ref_end = Tensor::new(vec![self.ref_audio_end_token], &self.device)?;
+                let ref_token = Tensor::zeros(audio_length, DType::U32, &self.device)?;
+                target_token = Tensor::cat(&[&ref_start, &ref_token, &ref_end, &target_token], 0)?;
+                let text_mask = Tensor::cat(
+                    &[
+                        Tensor::zeros(1, self.dtype, &self.device)?,
+                        Tensor::zeros(audio_length, self.dtype, &self.device)?,
+                        Tensor::zeros(1, self.dtype, &self.device)?,
+                        Tensor::ones(target_len, self.dtype, &self.device)?,
+                    ],
+                    D::Minus1,
+                )?;
+                let audio_mask = Tensor::cat(
+                    &[
+                        Tensor::zeros(1, self.dtype, &self.device)?,
+                        Tensor::ones(audio_length, self.dtype, &self.device)?,
+                        Tensor::zeros(1, self.dtype, &self.device)?,
+                        Tensor::zeros(target_len, self.dtype, &self.device)?,
+                    ],
+                    D::Minus1,
+                )?;
+                return Ok((
+                    target_token,
+                    text_mask,
+                    feat,
+                    audio_mask,
+                    target_text_length,
+                    Some(VoxCPM2InputLayout {
+                        has_audio: true,
+                        audio_ranges: vec![(1, 1 + audio_length)],
+                    }),
+                ));
+            }
             let text_token = match cache.get("text_token") {
                 Some(token) => Tensor::cat(&[token, &target_text_token], 0)?,
                 None => target_text_token,
@@ -1082,10 +1129,6 @@ impl VoxCPMModel {
             let audio_start = Tensor::new(vec![self.audio_start_token as u32], &self.device)?;
             let mut text_token = Tensor::cat(&[text_token, audio_start], D::Minus1)?;
             let text_length = text_token.dim(0)?;
-            let (audio_length, cached_feat) = match cache.get("audio_feat") {
-                Some(feat) => (feat.dim(0)?, Some(feat.clone())),
-                None => (0, None),
-            };
             if audio_length > 0 {
                 let text_pad_token = Tensor::zeros(audio_length, DType::U32, &self.device)?;
                 text_token = Tensor::cat(&[text_token, text_pad_token], D::Minus1)?;
@@ -1104,20 +1147,6 @@ impl VoxCPMModel {
                     D::Minus1,
                 )?;
                 let feat = cached_feat.unwrap().to_dtype(self.dtype)?;
-                if self.config.is_voxcpm2() {
-                    let layout = VoxCPM2InputLayout {
-                        has_audio: audio_length > 0,
-                        audio_ranges: vec![(text_length, text_length + audio_length)],
-                    };
-                    return Ok((
-                        text_token,
-                        text_mask,
-                        feat,
-                        audio_mask,
-                        target_text_length,
-                        Some(layout),
-                    ));
-                }
                 let audio_pad_feat = Tensor::zeros(
                     (text_length, self.patch_size, self.audio_vae.latent_dim),
                     self.dtype,
