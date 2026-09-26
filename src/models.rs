@@ -803,8 +803,6 @@ pub struct VoxCPMModel {
     config: VoxCPMConfig,
     patch_size: usize,
     audio_start_token: usize,
-    ref_audio_start_token: u32,
-    ref_audio_end_token: u32,
     chunk_size: usize,
     sample_rate: usize,
     #[allow(dead_code)]
@@ -843,8 +841,6 @@ impl VoxCPMModel {
             qroot.pp("base_lm"),
         )?;
         let audio_start_token = 101usize;
-        let ref_audio_start_token = 103u32;
-        let ref_audio_end_token = 104u32;
         let mut residual_lm_config = config.lm_config.clone();
         residual_lm_config.num_hidden_layers = config.residual_lm_num_layers;
         residual_lm_config.vocab_size = 0;
@@ -951,8 +947,6 @@ impl VoxCPMModel {
             config,
             patch_size,
             audio_start_token,
-            ref_audio_start_token,
-            ref_audio_end_token,
             chunk_size: audio_vae.chunk_size,
             sample_rate: audio_vae.sample_rate,
             out_sample_rate: audio_vae.out_sample_rate,
@@ -1079,49 +1073,8 @@ impl VoxCPMModel {
                 Some(feat) => (feat.dim(0)?, Some(feat.clone())),
                 None => (0, None),
             };
-            if self.config.is_voxcpm2() && audio_length > 0 {
-                // Reference audio belongs in the ref-token span before the
-                // target text. Placing the cache after the text makes VoxCPM2
-                // treat it as continuation padding, so the spoken output never
-                // conditions on the clip.
-                let feat = cached_feat.unwrap().to_dtype(self.dtype)?;
-                let audio_start = Tensor::new(vec![self.audio_start_token as u32], &self.device)?;
-                let mut target_token = Tensor::cat(&[target_text_token, audio_start], D::Minus1)?;
-                let target_len = target_token.dim(0)?;
-                let ref_start = Tensor::new(vec![self.ref_audio_start_token], &self.device)?;
-                let ref_end = Tensor::new(vec![self.ref_audio_end_token], &self.device)?;
-                let ref_token = Tensor::zeros(audio_length, DType::U32, &self.device)?;
-                target_token = Tensor::cat(&[&ref_start, &ref_token, &ref_end, &target_token], 0)?;
-                let text_mask = Tensor::cat(
-                    &[
-                        Tensor::zeros(1, self.dtype, &self.device)?,
-                        Tensor::zeros(audio_length, self.dtype, &self.device)?,
-                        Tensor::zeros(1, self.dtype, &self.device)?,
-                        Tensor::ones(target_len, self.dtype, &self.device)?,
-                    ],
-                    D::Minus1,
-                )?;
-                let audio_mask = Tensor::cat(
-                    &[
-                        Tensor::zeros(1, self.dtype, &self.device)?,
-                        Tensor::ones(audio_length, self.dtype, &self.device)?,
-                        Tensor::zeros(1, self.dtype, &self.device)?,
-                        Tensor::zeros(target_len, self.dtype, &self.device)?,
-                    ],
-                    D::Minus1,
-                )?;
-                return Ok((
-                    target_token,
-                    text_mask,
-                    feat,
-                    audio_mask,
-                    target_text_length,
-                    Some(VoxCPM2InputLayout {
-                        has_audio: true,
-                        audio_ranges: vec![(1, 1 + audio_length)],
-                    }),
-                ));
-            }
+            // Continuation clone: prompt transcript, then the line to speak,
+            // then the reference audio. Same arrangement VoxCPM 1 used.
             let text_token = match cache.get("text_token") {
                 Some(token) => Tensor::cat(&[token, &target_text_token], 0)?,
                 None => target_text_token,
@@ -1147,6 +1100,19 @@ impl VoxCPMModel {
                     D::Minus1,
                 )?;
                 let feat = cached_feat.unwrap().to_dtype(self.dtype)?;
+                if self.config.is_voxcpm2() {
+                    return Ok((
+                        text_token,
+                        text_mask,
+                        feat,
+                        audio_mask,
+                        target_text_length,
+                        Some(VoxCPM2InputLayout {
+                            has_audio: true,
+                            audio_ranges: vec![(text_length, text_length + audio_length)],
+                        }),
+                    ));
+                }
                 let audio_pad_feat = Tensor::zeros(
                     (text_length, self.patch_size, self.audio_vae.latent_dim),
                     self.dtype,
@@ -1186,7 +1152,6 @@ impl VoxCPMModel {
             ));
         }
 
-        let has_prompt_text = prompt_text.is_some();
         let encoded_text = if let Some(p_text) = prompt_text {
             p_text + &target_text
         } else {
@@ -1204,47 +1169,6 @@ impl VoxCPMModel {
 
         if let Some(feat) = audio_feat {
             let audio_length = feat.dim(0)?;
-            if !has_prompt_text && self.config.is_voxcpm2() {
-                let target_only = self.tokenizer.encode(target_text.clone())?;
-                let mut text_token =
-                    Tensor::from_slice(&target_only, target_only.len(), &self.device)?;
-                text_token = Tensor::cat(&[text_token, audio_start], D::Minus1)?;
-                let text_length = text_token.dim(0)?;
-                let ref_start = Tensor::new(vec![self.ref_audio_start_token], &self.device)?;
-                let ref_end = Tensor::new(vec![self.ref_audio_end_token], &self.device)?;
-                let ref_token = Tensor::zeros(audio_length, DType::U32, &self.device)?;
-                text_token = Tensor::cat(&[&ref_start, &ref_token, &ref_end, &text_token], 0)?;
-                let text_mask = Tensor::cat(
-                    &[
-                        Tensor::zeros(1, self.dtype, &self.device)?,
-                        Tensor::zeros(audio_length, self.dtype, &self.device)?,
-                        Tensor::zeros(1, self.dtype, &self.device)?,
-                        Tensor::ones(text_length, self.dtype, &self.device)?,
-                    ],
-                    D::Minus1,
-                )?;
-                let audio_mask = Tensor::cat(
-                    &[
-                        Tensor::zeros(1, self.dtype, &self.device)?,
-                        Tensor::ones(audio_length, self.dtype, &self.device)?,
-                        Tensor::zeros(1, self.dtype, &self.device)?,
-                        Tensor::zeros(text_length, self.dtype, &self.device)?,
-                    ],
-                    D::Minus1,
-                )?;
-                return Ok((
-                    text_token,
-                    text_mask,
-                    feat,
-                    audio_mask,
-                    target_text_length,
-                    Some(VoxCPM2InputLayout {
-                        has_audio: true,
-                        audio_ranges: vec![(1, 1 + audio_length)],
-                    }),
-                ));
-            }
-
             text_token = Tensor::cat(&[text_token, audio_start], D::Minus1)?;
             let text_length = text_token.dim(0)?;
             let text_pad_token = Tensor::zeros(audio_length, DType::U32, &self.device)?;
@@ -1325,7 +1249,7 @@ impl VoxCPMModel {
         prompt_wav_path: Option<String>,
         config: VoxCPMGenerationConfig,
     ) -> Result<Tensor> {
-        let (text_token, text_mask, audio_feat, audio_mask, target_text_length, _layout) =
+        let (text_token, text_mask, audio_feat, audio_mask, target_text_length, layout) =
             self.prepare_full_inputs(target_text, prompt_text, prompt_wav_path, None)?;
         let params = GenerationParams::resolve(config, target_text_length);
         let decode_audio = self._generate(
@@ -1334,7 +1258,7 @@ impl VoxCPMModel {
             &audio_feat,
             &audio_mask,
             params,
-            None,
+            layout,
         )?;
         Ok(decode_audio)
     }

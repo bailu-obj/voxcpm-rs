@@ -6,7 +6,7 @@ Pure Rust implementation of [VoxCPM](https://huggingface.co/openbmb) text-to-spe
 ## Features
 
 - **VoxCPM family** — auto-detects VoxCPM, VoxCPM1.5, and VoxCPM2 from `config.json`
-- **Voice cloning** — reference WAV + transcript prompt cache for timbre/style transfer
+- **Voice cloning** — continuation prompt: transcript, then the line to speak, then the reference audio (`build_prompt_cache`)
 - **Streaming** — latent-to-audio chunks as `Iterator<Item = Result<Tensor>>`, plus PCM/WAV stream helpers
 - **In-memory output** — `to_wav`, `to_pcm`, and streaming byte iterators without touching disk
 - **GPU backends** — optional Metal (macOS) or CUDA via Candle feature flags
@@ -129,16 +129,29 @@ for chunk in gen.generate_pcm_stream_with_config("Hello.".into(), config)? {
 }
 ```
 
+### Voice-clone layout
+
+`build_prompt_cache(prompt_text, wav)` is OpenBMB **continuation** mode
+(`prompt_text` + `prompt_wav_path`), not the isolated reference channel
+(`reference_wav_path`, tokens 103/104). The assembled sequence is the
+prompt transcript, then the line to speak, then token 101 and the reference
+audio. VoxCPM2 reports that audio span through `VoxCPM2InputLayout` so the
+prefill scatters reference embeddings into the pad positions. The waveform
+is left-padded onto the patch grid, matching upstream continuation (the last
+patches are speech, and they seed the VAE prefix).
+
 ### Continuation across segments (`VoxCPMStreamContext`)
 
-Long replies are synthesized segment by segment. A `VoxCPMStreamContext` turns
-those segments into one continuing utterance instead of independent cold
-starts: after a segment finishes, feed its PCM back with
-`update_stream_context`; the next `generate_pcm_stream_continue` call
-conditions on the trailing audio (bounded to the last 4 seconds) and the
-segment transcript, so speaker and prosody carry across boundaries — the
-streaming-prefix principle applied across calls. The first segment runs cold,
-and already-synthesized audio is reused as context, never re-synthesized.
+Long replies are synthesized segment by segment.
+
+- **With a clone cache** (`build_prompt_cache`): every segment, including
+  later ones, conditions on that reference. `update_stream_context` leaves
+  the cache in place, so the voice does not drift onto the generated tail.
+- **Without a reference**: the first segment runs cold. After it finishes,
+  feed its PCM back with `update_stream_context`; the next
+  `generate_pcm_stream_continue` call conditions on the trailing audio
+  (bounded to the last 4 seconds) and the segment transcript. Already
+  synthesized audio is reused as context, never re-synthesized.
 
 ```rust
 use voxcpm_rs::VoxCPMStreamContext;
