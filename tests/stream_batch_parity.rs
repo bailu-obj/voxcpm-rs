@@ -4,8 +4,8 @@
 //! `VOXCPM2_MODEL_PATH=models/VoxCPM-0.5B cargo test -p voxcpm-rs --test stream_batch_parity -- --ignored --nocapture`
 
 use voxcpm_rs::profile::pcm_correlation;
-use voxcpm_rs::VoxCPMGeneratorOptions;
-use voxcpm_rs::{VoxCPMGenerationConfig, VoxCPMGenerator, COMPARE_FP_DEFAULT_SEED};
+use voxcpm_rs::{COMPARE_FP_DEFAULT_SEED, VoxCPMGenerationConfig, VoxCPMGenerator};
+use voxcpm_rs::{VoxCPMGeneratorOptions, VoxCPMQuantConfig, VoxCPMWeightQuant};
 
 const ONSET_SAMPLES: usize = 96_000; // 2 s @ 48 kHz
 const MIN_ONSET_CORR: f64 = 0.95;
@@ -17,10 +17,21 @@ fn example_text() -> String {
 #[test]
 #[ignore = "requires GPU and downloaded VoxCPM weights"]
 fn stream_concat_matches_batch_onset() -> anyhow::Result<()> {
+    check_stream_batch_parity(VoxCPMWeightQuant::None)
+}
+
+#[test]
+#[ignore = "requires GPU and downloaded VoxCPM weights"]
+fn stream_concat_matches_batch_onset_q8() -> anyhow::Result<()> {
+    check_stream_batch_parity(VoxCPMWeightQuant::Q8_0)
+}
+
+fn check_stream_batch_parity(quant: VoxCPMWeightQuant) -> anyhow::Result<()> {
     let model_path =
         std::env::var("VOXCPM2_MODEL_PATH").unwrap_or_else(|_| "models/VoxCPM-0.5B".to_string());
     let mut options = VoxCPMGeneratorOptions::default();
     options.seed = Some(COMPARE_FP_DEFAULT_SEED);
+    options.quant = VoxCPMQuantConfig::with_weight(quant);
     let mut generator = VoxCPMGenerator::new_with_options(&model_path, &options)?;
 
     if let (Ok(ref_wav), Ok(ref_text)) = (
@@ -52,7 +63,7 @@ fn stream_concat_matches_batch_onset() -> anyhow::Result<()> {
     let full_corr = pcm_correlation(&batch_pcm[..full_len], &stream_pcm[..full_len]);
 
     eprintln!(
-        "stream_batch_parity onset_corr={onset_corr:.4} full_corr={full_corr:.4} onset_samples={onset_len} full_samples={full_len}"
+        "stream_batch_parity quant={quant:?} onset_corr={onset_corr:.4} full_corr={full_corr:.4} onset_samples={onset_len} full_samples={full_len}"
     );
 
     assert!(

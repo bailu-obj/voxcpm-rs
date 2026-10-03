@@ -226,6 +226,18 @@ impl GateUpDownMLP {
 
 impl Module for GateUpDownMLP {
     fn forward(&self, xs: &Tensor) -> candle_core::Result<Tensor> {
+        #[cfg(feature = "metal")]
+        if crate::metal_ops::silu_mul_enabled()
+            && xs.device().is_metal()
+            && xs.dtype() == DType::F32
+            && matches!(self.act_fn, Activation::Silu)
+        {
+            if let GateUpProjs::Fused(fused) = &self.gate_up {
+                let gate_up = fused.forward(xs)?;
+                let res = gate_up.apply_op1_no_bwd(&crate::metal_ops::SiluMul)?;
+                return res.apply(&self.down_proj);
+            }
+        }
         let (gate, up) = match &self.gate_up {
             GateUpProjs::Fused(fused) => {
                 let parts = fused.forward_split(xs)?;

@@ -1,18 +1,18 @@
 //! VoxCPM benchmark CLI: load, optional prompt cache, stream/non-stream generation, RTF/TTFA.
 //!
 //! Quality fixtures (`--quality-matrix`) cover short interjections, the Paimon chat line,
-//! and 40/80/160-character prose for stop-schedule / long-text A/B.
+//! and short/medium/long prose for stop-schedule / long-text A/B.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use clap::Parser;
 use std::path::PathBuf;
 use std::time::Instant;
 use voxcpm_rs::{
-    audio_quality_ok, bench_profile_enabled, bottleneck_hint, compare_fp_enabled,
-    compare_fp_min_correlation, pcm_correlation, reset_stage_profile, take_stage_profile,
-    BenchmarkMetrics, QuantStats, StageProfile, VoxCPMGenerationConfig,
+    BenchmarkMetrics, COMPARE_FP_DEFAULT_SEED, QuantStats, StageProfile, VoxCPMGenerationConfig,
     VoxCPMGenerationDiagnostics, VoxCPMGenerator, VoxCPMGeneratorOptions, VoxCPMQuantConfig,
-    VoxCPMWeightQuant, COMPARE_FP_DEFAULT_SEED,
+    VoxCPMWeightQuant, audio_quality_ok, bench_profile_enabled, bottleneck_hint,
+    compare_fp_enabled, compare_fp_min_correlation, pcm_correlation, reset_stage_profile,
+    take_stage_profile,
 };
 
 /// Deterministic quality fixtures for stop / interjection / long-text A/B.
@@ -67,6 +67,10 @@ struct Args {
     #[arg(long)]
     device_id: Option<usize>,
 
+    /// Keep matching module paths in full precision (repeat for multiple patterns).
+    #[arg(long)]
+    quant_skip: Vec<String>,
+
     /// Fixed RNG seed (overrides `VOXCPM_SEED` when set).
     #[arg(long)]
     seed: Option<u64>,
@@ -110,6 +114,10 @@ struct Args {
     /// Measured runs; report median wall/RTF when >1.
     #[arg(long, default_value = "1")]
     runs: usize,
+
+    /// Fail if any measured run has RTF >= this limit (e.g. --max-rtf 1).
+    #[arg(long)]
+    max_rtf: Option<f64>,
 
     /// Latents per VAE decode after the first chunk (streaming only).
     #[arg(long)]
@@ -241,12 +249,29 @@ fn run_one_text(
         None
     };
 
+    if let Some(limit) = args.max_rtf {
+        if !limit.is_finite() || limit <= 0.0 {
+            bail!("--max-rtf must be finite and > 0");
+        }
+    }
+    // Keep the model and prompt resident, as the production provider does.
+    // Warmup now warms the same caches used by the measured generations.
+    let (mut generator, load_secs, prompt_cache_secs) = load_generator(args, options)?;
     for _ in 0..args.warmup {
-        let _ = run_measured(args, options, generation_config, None, ref_wav_pcm)?;
+        let _ = run_measured(
+            args,
+            &mut generator,
+            load_secs,
+            prompt_cache_secs,
+            generation_config,
+            None,
+            ref_wav_pcm,
+        )?;
     }
 
     let mut walls = Vec::new();
     let mut rtfs = Vec::new();
+    let mut correlations = Vec::new();
     let mut last: Option<(
         BenchmarkMetrics,
         QuantStats,
@@ -256,16 +281,29 @@ fn run_one_text(
         Option<VoxCPMGenerationDiagnostics>,
     )> = None;
 
-    for _ in 0..args.runs.max(1) {
+    for run in 0..args.runs.max(1) {
         let result = run_measured(
             args,
-            options,
+            &mut generator,
+            load_secs,
+            prompt_cache_secs,
             generation_config,
             fp_baseline.as_ref(),
             ref_wav_pcm,
         )?;
+        println!(
+            "VOXCPM_RUN_JSON {}",
+            serde_json::json!({
+                "fixture": fixture_id, "run": run + 1, "wall_secs": result.0.wall_secs,
+                "audio_secs": result.0.audio_secs, "rtf": result.0.rtf,
+                "ttfa_secs": result.0.ttfa_secs, "fp_correlation": result.0.fp_correlation,
+            })
+        );
         walls.push(result.0.wall_secs);
         rtfs.push(result.0.rtf);
+        if let Some(corr) = result.0.fp_correlation {
+            correlations.push(corr);
+        }
         last = Some(result);
     }
 
@@ -310,7 +348,7 @@ fn run_one_text(
     }
 
     // Print metrics before quality gate so sweeps still capture RTF on soft fails.
-    if let Some(corr) = metrics.fp_correlation {
+    if let Some(corr) = correlations.iter().copied().reduce(f64::min) {
         eprintln!("VOXCPM_COMPARE_FP correlation={corr:.4} threshold={quality_threshold:.2}");
         if corr < quality_threshold {
             bail!(
@@ -320,6 +358,12 @@ fn run_one_text(
         }
     }
 
+    if let Some(limit) = args.max_rtf {
+        let worst = rtfs.iter().copied().fold(0.0_f64, f64::max);
+        if worst >= limit {
+            bail!("RTF gate failed: worst run {worst:.4} >= {limit:.4}");
+        }
+    }
     Ok(())
 }
 
@@ -374,9 +418,29 @@ fn region_stats(samples: &[i16], edge: usize) -> (f64, f64, u16) {
     (rms(head), rms(tail), peak)
 }
 
-fn run_measured(
+fn load_generator(
     args: &Args,
     options: &VoxCPMGeneratorOptions,
+) -> Result<(VoxCPMGenerator, f64, f64)> {
+    let load_start = Instant::now();
+    let mut generator = VoxCPMGenerator::new_with_options(args.model.to_str().unwrap(), options)?;
+    let load_secs = load_start.elapsed().as_secs_f64();
+
+    let mut prompt_cache_secs = 0.0;
+    if let (Some(wav), Some(text)) = (&args.ref_wav, &args.ref_text) {
+        let t0 = Instant::now();
+        generator.build_prompt_cache(text.clone(), wav.to_string_lossy().to_string())?;
+        prompt_cache_secs = t0.elapsed().as_secs_f64();
+    }
+
+    Ok((generator, load_secs, prompt_cache_secs))
+}
+
+fn run_measured(
+    args: &Args,
+    generator: &mut VoxCPMGenerator,
+    load_secs: f64,
+    prompt_cache_secs: f64,
     generation_config: VoxCPMGenerationConfig,
     fp_baseline: Option<&(f64, f64, usize, Vec<i16>)>,
     ref_wav_pcm: Option<&[i16]>,
@@ -392,24 +456,14 @@ fn run_measured(
         reset_stage_profile();
     }
 
-    let load_start = Instant::now();
-    let mut generator = VoxCPMGenerator::new_with_options(args.model.to_str().unwrap(), options)?;
-    let load_secs = load_start.elapsed().as_secs_f64();
     let quant_stats = generator.quant_stats();
     let sample_rate = generator.sample_rate() as u32;
 
-    let mut prompt_cache_secs = 0.0;
-    if let (Some(wav), Some(text)) = (&args.ref_wav, &args.ref_text) {
-        let t0 = Instant::now();
-        generator.build_prompt_cache(text.clone(), wav.to_string_lossy().to_string())?;
-        prompt_cache_secs = t0.elapsed().as_secs_f64();
-    }
-
     let wall_start = Instant::now();
     let (audio_secs, ttfa_secs, pcm_chunks, samples) = if args.stream {
-        run_stream(&mut generator, &args.text, generation_config)?
+        run_stream(generator, &args.text, generation_config)?
     } else {
-        run_batch(&mut generator, &args.text, generation_config)?
+        run_batch(generator, &args.text, generation_config)?
     };
     let wall_secs = wall_start.elapsed().as_secs_f64();
     let diagnostics = generator.last_diagnostics();
@@ -456,6 +510,10 @@ fn build_options(
     } else {
         VoxCPMQuantConfig::with_weight(quant_weight)
     };
+    options
+        .quant
+        .skip_patterns
+        .extend(args.quant_skip.iter().cloned());
     options.seed = seed.or(args.seed);
     options
 }

@@ -142,7 +142,21 @@ impl VoxCPMQuantConfig {
     /// Whether a fully-qualified module path should remain in full precision.
     #[must_use]
     pub fn should_skip_module(&self, module_path: &str) -> bool {
-        const DEFAULT_SKIP: &[&str] = &["embed_tokens", "stop_head", "stop_proj", "fsq_layer"];
+        const DEFAULT_SKIP: &[&str] = &[
+            "embed_tokens",
+            "stop_head",
+            "stop_proj",
+            "fsq_layer",
+            // Small conditioning/output bridges carry quantization error into
+            // every denoising step. Keeping these FP improves waveform fidelity
+            // while leaving the large transformer matrices on the Q8 fast path.
+            "enc_to_lm_proj",
+            "lm_to_dit_proj",
+            "res_to_dit_proj",
+            "feat_decoder.estimator.in_proj",
+            "feat_decoder.estimator.cond_proj",
+            "feat_decoder.estimator.out_proj",
+        ];
         for pat in DEFAULT_SKIP {
             if module_path.contains(pat) {
                 return true;
@@ -369,6 +383,23 @@ mod tests {
         assert!(cfg.should_skip_module("stop_head"));
         assert!(cfg.should_skip_module("fsq_layer.in_proj"));
         assert!(!cfg.should_skip_module("base_lm.layers.0.mlp.down_proj"));
+        for path in [
+            "enc_to_lm_proj",
+            "lm_to_dit_proj",
+            "res_to_dit_proj",
+            "feat_decoder.estimator.in_proj",
+            "feat_decoder.estimator.cond_proj",
+            "feat_decoder.estimator.out_proj",
+        ] {
+            assert!(
+                cfg.should_skip_module(path),
+                "conditioning bridge must stay FP: {path}"
+            );
+        }
+        assert!(
+            !cfg.should_skip_module("feat_decoder.estimator.decoder.layers.0.self_attn.q_proj")
+        );
+        assert!(!cfg.should_skip_module("feat_decoder.estimator.decoder.layers.0.mlp.down_proj"));
     }
 
     #[test]

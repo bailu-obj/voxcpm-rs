@@ -11,6 +11,8 @@ keywords = ["tts", "text-to-speech", "audio", "ai", "voxcpm"]
 candle-core = "0.10.2"
 candle-nn = "0.10.2"
 candle-transformers = "0.10.2"
+candle-metal-kernels = { version = "0.10.2", optional = true }
+objc2-metal = { version = "0.3.2", optional = true }
 candle-flash-attn = { version = "0.10.2", optional = true }
 
 serde = { version = "1.0", features = ["derive"] }
@@ -30,7 +32,7 @@ clap = { version = "4.6.1", features = ["derive"] }
 [features]
 default = []
 cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
-metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal", "dep:candle-metal-kernels", "dep:objc2-metal"]
 flash-attn = ["candle-flash-attn"]
 
 [[example]]

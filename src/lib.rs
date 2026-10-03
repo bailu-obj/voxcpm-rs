@@ -8,6 +8,8 @@ pub mod config;
 pub mod generate;
 pub mod kv_cache;
 pub mod linear;
+#[cfg(feature = "metal")]
+mod metal_ops;
 pub mod minicpm4;
 pub mod models;
 pub mod position_embed;

@@ -248,6 +248,18 @@ impl Snake1d {
     // x + sin(alpha*x)^2 / alpha
     #[inline]
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        #[cfg(feature = "metal")]
+        if crate::metal_ops::snake_enabled()
+            && x.device().is_metal()
+            && x.dtype() == candle_core::DType::F32
+            && x.is_contiguous()
+        {
+            return Ok(x.apply_op3_no_bwd(
+                &self.alpha,
+                &self.alpha_recip,
+                &crate::metal_ops::Snake,
+            )?);
+        }
         let ax = x.broadcast_mul(&self.alpha)?;
         let x_out = ax.sin()?.sqr()?.broadcast_mul(&self.alpha_recip)?;
         Ok(x.add(&x_out)?)

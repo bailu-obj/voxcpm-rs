@@ -12,7 +12,7 @@ use crate::{
     utils::device::get_device,
 };
 
-const DEFAULT_INFERENCE_TIMESTEPS: usize = 10;
+const DEFAULT_INFERENCE_TIMESTEPS: usize = 12;
 pub const DEFAULT_STREAM_DECODE_LATENT_BATCH: usize = 12;
 /// Bailu quality default: first streaming VAE decode batch, matched to the
 /// steady-state batch (larger first decode, ~320 ms more TTFA than batch 4).
@@ -115,7 +115,7 @@ impl VoxCPMGenerationConfig {
     /// Default production / Bailu balanced preset (also [`Default`]).
     ///
     /// Matches OpenBMB VoxCPM2 stop schedule plus Bailu streaming batches:
-    /// `min_len=2`, `stop_check_interval=1`, ratio `6.0`, latent VAE batches `4` then `12`.
+    /// `min_len=2`, `stop_check_interval=1`, ratio `6.0`, latent VAE batches `12` then `12`, with 12 denoising steps.
     pub fn voice_clone() -> Self {
         Self {
             min_len: DEFAULT_MIN_LEN,
@@ -655,7 +655,7 @@ mod tests {
         assert!((cfg.retry_badcase_ratio_threshold - 6.0).abs() < 1e-9);
         assert_eq!(cfg.stream_decode_initial_latent_batch, 12);
         assert_eq!(cfg.stream_decode_latent_batch, 12);
-        assert_eq!(cfg.inference_timesteps, 10);
+        assert_eq!(cfg.inference_timesteps, 12);
         assert!((cfg.cfg_full_fraction - 1.0).abs() < 1e-9);
     }
 

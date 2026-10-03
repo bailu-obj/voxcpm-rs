@@ -11,7 +11,7 @@ Pure Rust implementation of [VoxCPM](https://huggingface.co/openbmb) text-to-spe
 - **In-memory output** — `to_wav`, `to_pcm`, and streaming byte iterators without touching disk
 - **GPU backends** — optional Metal (macOS) or CUDA via Candle feature flags
 - **Weight quantization** — live `QMatMul` paths for `q8_0` / K-quants with quality gates
-- **Metal dispatch cuts** — fused QKV / gate+up matmuls, fused RoPE, GQA without `repeat_kv` (decode-only fused SDPA)
+- **Metal dispatch cuts** — fused QKV / gate+up matmuls, fused RoPE, GQA without `repeat_kv` (decode-only fused SDPA), fused F32 SiLU×up and VAE Snake activations
 - **Benchmarking** — RTF, TTFA, FP-vs-quant / reference-WAV correlation checks
 
 ## Requirements
@@ -80,7 +80,7 @@ RTF / TTFA benchmark (VoxCPM2 streaming, official full CFG):
 cargo run --release -p voxcpm-rs --features metal --example voxcpm2_benchmark -- \
   --model models/VoxCPM2 --stream \
   --quant q8_0 --cfg-full-fraction 1.0 \
-  --inference-timesteps 10 \
+  --inference-timesteps 12 \
   --stream-decode-initial-latent-batch 12 \
   --stream-decode-latent-batch 12 \
   --stop-check-interval 1 --min-len 2 \
@@ -196,6 +196,8 @@ Notes:
 
 Compute dtype is resolved internally (no user-facing option): **quantized runs use F32 activations** — `QMatMul` accumulates in F32, so half-precision activations only add per-layer cast kernels (measured ~3% RTF slower on Apple Silicon) — while dense runs (`quant=none`) keep the checkpoint's half precision (BF16) so weight streaming stays cheap. Use `q8_0` for throughput.
 
+Q8/K-quant policies keep embeddings, stop/FSQ layers, and six small conditioning/output bridges in full precision: `enc_to_lm_proj`, `lm_to_dit_proj`, `res_to_dit_proj`, and DiT estimator `in_proj` / `cond_proj` / `out_proj`. The large LM, encoder, and DiT matrices remain quantized. This improved 12-step correlation to dense FP from **0.9922 → 0.9961** on the fixed-seed M4 Pro fixture (246 quantized matrices, 10 skipped).
+
 ### Generation presets (`VoxCPMGenerationConfig`)
 
 | Preset | Use case |
@@ -205,7 +207,7 @@ Compute dtype is resolved internally (no user-facing option): **quantized runs u
 | `low_latency()` | Smaller VAE batches, fewer stop checks |
 | `metal_rtf()` | Metal throughput tuning |
 
-Default `voice_clone()` / `Default` (balanced preset): `inference_timesteps=10`, `cfg_value=2.0`, `cfg_full_fraction=1.0`, `min_len=2`, `max_len=500`, `retry_badcase_ratio_threshold=6.0`, `stream_decode_initial_latent_batch=12`, `stream_decode_latent_batch=12`, `stop_check_interval=1`. (`retry_badcase` only scales the latent budget in this port — it does not retry seeds.) After generation, `VoxCPMGenerator::last_diagnostics()` reports `stop_reason` (`stop_head` | `max_len`), latent count, and effective max length.
+Default `voice_clone()` / `Default` (balanced preset): `inference_timesteps=12`, `cfg_value=2.0`, `cfg_full_fraction=1.0`, `min_len=2`, `max_len=500`, `retry_badcase_ratio_threshold=6.0`, `stream_decode_initial_latent_batch=12`, `stream_decode_latent_batch=12`, `stop_check_interval=1`. (`retry_badcase` only scales the latent budget in this port — it does not retry seeds.) After generation, `VoxCPMGenerator::last_diagnostics()` reports `stop_reason` (`stop_head` | `max_len`), latent count, and effective max length.
 
 ## Weight quantization
 
@@ -281,7 +283,7 @@ Measured on **Mac mini M4 Pro (Apple M4 Pro, 64 GB)**, 2026-08-19. Numbers vary 
 | Eager (`VOXCPM_FUSED_SDPA=0 VOXCPM_FUSE_PROJ=0 VOXCPM_FUSED_ROPE=0`, q8_0+f16) | 1.18 | 0.98 s | 432 quantized matrices |
 | FP reference (dense BF16 weights) | ~1.04 | ~0.84 s | baseline only; checkpoint dtype |
 | q8_0 + explicit f16 (historical) | 0.98 | 0.85 s | F16 acts added per-matmul cast churn |
-| **Current defaults** (fused proj + RoPE + GQA, q8_0 → F32 acts, VAE batches 4→12) | **0.84–0.95** | **0.76–0.85 s** | 252 quantized matrices; f16-vs-f32 outputs corr 0.9987; long-line RTF 0.80 |
+| **2026-08 defaults** (fused proj + RoPE + GQA, q8_0 → F32 acts, VAE batches 4→12) | **0.84–0.95** | **0.76–0.85 s** | 252 quantized matrices; f16-vs-f32 outputs corr 0.9987; long-line RTF 0.80 |
 
 > Fixed (2026-08-19): prefill fed strided tensor views (e.g. stride `[4,4,1,136]` for a `[1,34,4,64]` input) into the F32 Metal gemm, which rejects non-contiguous layouts (`Invalid matmul arguments …`) — the old F16 kernel happened to tolerate them. Non-contiguous inputs are now materialized (`VoxCPMLocEnc::forward`, `LinearX::forward`). Stage split via `--profile` (`cfm`, `lm`, `vae`, `VOXCPM_BOTTLENECK_HINT`) — note unsynced stage timers attribute GPU-drain wait to the first host-readback stage (the stop head at `interval=1`); true synced split is CFM/DiT 61% · VAE 26% · LM 13% · stop 0.3%.
 
@@ -292,9 +294,11 @@ cargo run --release -p voxcpm-rs --features metal --example voxcpm2_benchmark --
   --model models/VoxCPM-0.5B --text "测试" --quant q8_0 --compare-fp --profile --runs 3
 ```
 
-Emits `VOXCPM_BENCH_JSON`, `VOXCPM_QUANT_JSON`, and `VOXCPM_BOTTLENECK_HINT`.
+Emits `VOXCPM_BENCH_JSON`, per-run `VOXCPM_RUN_JSON`, `VOXCPM_QUANT_JSON`, and `VOXCPM_BOTTLENECK_HINT`. Warmup and measured runs reuse one resident model and prompt cache. Pass `--max-rtf 1` to fail if **any** measured run reaches RTF ≥ 1; loading and prompt construction are reported separately. The default voice-clone preset now uses **12** denoising steps; explicit 10-step settings remain supported. More integration steps increase denoising resolution, while perceptual quality still requires listening.
 
 ## Metal inference optimizations
+
+The 2026-10-04 M4 Pro controlled run measured 10-step RTF **0.766 → 0.738** with the new activation fusions (3.7% less wall time, PCM correlation ≥0.9999999993). The new **12-step** default with FP bridges measured RTF **0.833**; all 21 quality-fixture runs stayed below 1 (worst **0.922**). These are warmed Metal measurements; cold load and other hardware require separate checks. [Detailed experiment log](../../docs/voxcpm2_rtf_baseline.md#2026-10-04-fused-activations-and-12-step-preset).
 
 VoxCPM2 DiT/LM inference is **launch-overhead-bound** on Metal (many tiny kernels per Euler step), not weight-bandwidth-bound. Defaults cut dispatches without changing math:
 
@@ -303,6 +307,8 @@ VoxCPM2 DiT/LM inference is **launch-overhead-bound** on Metal (many tiny kernel
 | Fused QKV + gate/up `QMatMul` | `linear.rs` / `common.rs` | `VOXCPM_FUSE_PROJ=0` |
 | Fused RoPE (`candle_nn::rotary_emb::rope`, F32 on F16 acts) | `position_embed/rope.rs` | `VOXCPM_FUSED_ROPE=0` |
 | GQA without `repeat_kv` (unmasked DiT / decode) | `common.rs` | — (masked LM prefill still tiles) |
+| Fused F32 SiLU×up (one dispatch over gate/up projection) | `metal_ops.rs` / `common.rs` | `VOXCPM_FUSED_SILU_MUL=0` |
+| Fused F32 VAE Snake (five dispatches → one) | `metal_ops.rs` / `audio_vae.rs` | `VOXCPM_FUSED_SNAKE=0` |
 | Fused Metal SDPA | `common.rs` `attention_forward` | `VOXCPM_FUSED_SDPA=0` |
 
 **SDPA policy:** default `VOXCPM_FUSED_SDPA_MAX_QLEN=1` (decode / vector kernel only). DiT seq≈11 stays on eager attention — the Metal vector kernel NaNs at `q_seq>1` for this GQA shape, and the tiled full kernel previously corrupted audio (corr≈0.03). Do not raise `MAX_QLEN` for production.
@@ -321,6 +327,8 @@ VoxCPM2 DiT/LM inference is **launch-overhead-bound** on Metal (many tiny kernel
 | `VOXCPM_PROFILE_STREAM` | Stream chunk timing (inference vs VAE decode) |
 | `VOXCPM_PROFILE_SYNC=1` | Sync GPU around stage timers (inflates wall RTF) |
 | `VOXCPM_FUSE_PROJ=0` | Disable fused QKV / gate+up projections |
+| `VOXCPM_FUSED_SILU_MUL=0` | Disable fused F32 Metal SiLU×up |
+| `VOXCPM_FUSED_SNAKE=0` | Disable fused F32 Metal VAE Snake |
 | `VOXCPM_FUSED_ROPE=0` | Disable candle fused RoPE (eager rotate-half) |
 | `VOXCPM_FUSED_SDPA=0` | Force eager attention (disable Metal SDPA) |
 | `VOXCPM_FUSED_SDPA_MAX_QLEN` | Max fused query length (**default 1**; experimental only) |
