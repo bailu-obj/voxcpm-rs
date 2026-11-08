@@ -1,5 +1,5 @@
 use anyhow::{Ok, Result};
-use candle_core::{DType, Device, DeviceLocation, Tensor, pickle::read_all_with_key};
+use candle_core::{pickle::read_all_with_key, DType, Device, DeviceLocation, Tensor};
 use candle_nn::VarBuilder;
 use std::collections::HashMap;
 
@@ -197,16 +197,7 @@ pub struct VoxCPMGenerator {
     generation_seed: Option<u64>,
 }
 
-/// How much trailing audio the stream context keeps as the next segment's
-/// prompt conditioning (seconds).
-const STREAM_CONTEXT_TAIL_SECS: usize = 4;
-
-/// Per-reply continuation state for streaming synthesis: the transcript and
-/// trailing audio of the segment that was just synthesized, re-fed as the
-/// prompt conditioning of the next segment of the same reply (the
-/// streaming-prefix principle: the utterance continues instead of restarting
-/// from silence, and already-synthesized audio is never redone — it is
-/// reused as context).
+/// Request-local continuation for generation without a reference voice.
 #[derive(Default)]
 pub struct VoxCPMStreamContext {
     prompt_cache: Option<HashMap<String, Tensor>>,
@@ -390,6 +381,11 @@ impl VoxCPMGenerator {
         Ok(())
     }
 
+    /// Restore unconditioned generation.
+    pub fn clear_prompt_cache(&mut self) {
+        self.prompt_cache = None;
+    }
+
     /// Build prompt cache for batch processing
     pub fn build_prompt_cache(
         &mut self,
@@ -515,35 +511,27 @@ impl VoxCPMGenerator {
     /// Streaming PCM generation continuing a caller-owned
     /// [`VoxCPMStreamContext`].
     ///
-    /// A clone prompt built by [`Self::build_prompt_cache`] is the voice for
-    /// every segment, including ones after the first. Only when there is no
-    /// reference audio do later segments condition on the tail fed back via
-    /// [`Self::update_stream_context`].
+    /// Every cloned segment uses the original selected reference. Unconditioned
+    /// generation can use a request-local, complete accepted prefix.
     pub fn generate_pcm_stream_continue<'a>(
         &'a mut self,
         target_text: String,
         config: VoxCPMGenerationConfig,
         normalizer: &'a mut crate::utils::audio::StreamPcmNormalizer,
-        ctx: &'a VoxCPMStreamContext,
+        ctx: &VoxCPMStreamContext,
     ) -> Result<Box<dyn Iterator<Item = Result<Vec<i16>>> + 'a>> {
         self.apply_generation_seed()?;
-        let stream: Box<dyn Iterator<Item = Result<Tensor>> + '_> = if let Some(cache) =
-            self.prompt_cache.as_ref()
-        {
-            Box::new(
-                self.voxcpm
-                    .generate_stream_with_prompt_cache(target_text, cache, config)?,
-            )
-        } else if let Some(cache) = ctx.prompt_cache.as_ref() {
-            Box::new(
-                self.voxcpm
-                    .generate_stream_with_prompt_cache(target_text, cache, config)?,
-            )
-        } else {
-            Box::new(
+        let cache = self.prompt_cache.as_ref().or(ctx.prompt_cache.as_ref());
+        let stream: Box<dyn Iterator<Item = Result<Tensor>> + '_> = match cache {
+            Some(cache) => Box::new(self.voxcpm.generate_stream_with_prompt_cache(
+                target_text,
+                cache,
+                config,
+            )?),
+            None => Box::new(
                 self.voxcpm
                     .generate_stream(target_text, None, None, config)?,
-            )
+            ),
         };
         Ok(Box::new(PcmStreamIter {
             inner: stream,
@@ -551,28 +539,30 @@ impl VoxCPMGenerator {
         }))
     }
 
-    /// Feed one finished segment back into the context: its transcript and
-    /// trailing PCM become the next segment's prompt conditioning. Only the
-    /// last [`STREAM_CONTEXT_TAIL_SECS`] seconds are kept, so conditioning
-    /// cost stays flat however long the reply grows.
-    ///
-    /// A reference-audio prompt cache is left in place. Following segments
-    /// keep cloning from that audio instead of switching to the generated tail.
+    /// For unconditioned generation, keep one complete accepted segment within
+    /// this request. A selected reference always remains the voice authority.
+    /// Oversized audio stays unconditioned so transcript and PCM remain aligned.
     pub fn update_stream_context(
         &mut self,
         ctx: &mut VoxCPMStreamContext,
         segment_text: &str,
         segment_pcm: &[i16],
     ) -> Result<()> {
-        if self.prompt_cache.is_some() || segment_pcm.is_empty() {
+        if self.prompt_cache.is_some()
+            || ctx.is_continued()
+            || segment_pcm.len() < self.sample_rate / 2
+            || segment_pcm.len() > self.sample_rate * 18
+            || segment_text.chars().filter(|c| c.is_alphanumeric()).count() < 8
+            || !self
+                .last_diagnostics()
+                .is_some_and(|d| d.stop_reason == VoxCPMStopReason::StopHead)
+        {
             return Ok(());
         }
-        let tail = STREAM_CONTEXT_TAIL_SECS * self.sample_rate;
-        let start = segment_pcm.len().saturating_sub(tail);
-        ctx.prompt_cache = Some(
-            self.voxcpm
-                .build_prompt_cache_from_pcm(segment_text.to_string(), &segment_pcm[start..])?,
-        );
+        let generated = self
+            .voxcpm
+            .build_prompt_cache_from_pcm(segment_text.to_string(), segment_pcm)?;
+        ctx.prompt_cache = Some(generated);
         Ok(())
     }
 

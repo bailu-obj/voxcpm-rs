@@ -144,14 +144,13 @@ patches are speech, and they seed the VAE prefix).
 
 Long replies are synthesized segment by segment.
 
-- **With a clone cache** (`build_prompt_cache`): every segment, including
-  later ones, conditions on that reference. `update_stream_context` leaves
-  the cache in place, so the voice does not drift onto the generated tail.
-- **Without a reference**: the first segment runs cold. After it finishes,
-  feed its PCM back with `update_stream_context`; the next
-  `generate_pcm_stream_continue` call conditions on the trailing audio
-  (bounded to the last 4 seconds) and the segment transcript. Already
-  synthesized audio is reused as context, never re-synthesized.
+- With a clone cache, every segment uses the original selected reference.
+- Without a reference, the first naturally completed, acoustically checked segment
+  may provide a fixed prefix within the current request. Complete text stays paired
+  with complete audio; eligible clips are 0.5–18 seconds with at least eight
+  alphanumeric characters. Later output leaves this prefix unchanged.
+- Callers keep context request-local and discard it on failure/cancellation.
+  Generated audio always remains separate from the selected reference voice.
 
 ```rust
 use voxcpm_rs::VoxCPMStreamContext;
@@ -176,7 +175,7 @@ for segment in ["第一句比较长，说完自然停顿。", "第二句接着�
 Notes:
 
 - `update_stream_context` must run only after the stream iterator is fully
-  dropped (it re-encodes the tail through the VAE on the same generator).
+  dropped (it encodes the complete admitted segment on the same generator).
 - The prompt features are rebuilt in memory (`build_prompt_cache_from_pcm` on
   `VoxCPMModel`) — no WAV disk round-trip.
 - Sharing one `StreamPcmNormalizer` across the calls (as above) additionally

@@ -1,5 +1,5 @@
-use anyhow::{Result, anyhow};
-use candle_core::{D, Device, Tensor};
+use anyhow::{anyhow, Result};
+use candle_core::{Device, Tensor, D};
 use candle_nn::{Conv1d, Conv1dConfig, Module};
 use num::integer::gcd;
 use std::io::Cursor;
@@ -396,6 +396,12 @@ pub fn to_pcm_stream_chunk_with_normalizer(
     assert_eq!(audio.dim(0)?, 1, "audio channel must be 1");
     let audio = audio.squeeze(0)?;
     let audio_vec = audio.to_vec1::<f32>()?;
+    anyhow::ensure!(
+        audio_vec
+            .iter()
+            .all(|sample| sample.is_finite() && sample.abs() <= 8.0),
+        "VoxCPM produced invalid waveform samples"
+    );
     Ok(normalizer.normalize_chunk(&audio_vec))
 }
 
@@ -421,5 +427,24 @@ mod stream_pcm_normalizer_tests {
         assert!((norm.running_peak() - 0.5).abs() < 1e-6);
         let _ = norm.normalize_chunk(&[2.0, -1.0]);
         assert!((norm.running_peak() - 2.0).abs() < 1e-6);
+    }
+}
+
+#[cfg(test)]
+mod invalid_waveform_tests {
+    use super::*;
+    #[test]
+    fn rejected_samples_leave_the_stream_normalizer_usable() {
+        let mut normalizer = StreamPcmNormalizer::new();
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 100.0] {
+            let bad = Tensor::from_vec(vec![value; 16], (1, 16), &Device::Cpu).unwrap();
+            assert!(to_pcm_stream_chunk_with_normalizer(&bad, &mut normalizer).is_err());
+            assert_eq!(normalizer.running_peak(), 0.0);
+        }
+        let good = Tensor::from_vec(vec![0.1_f32, -0.1], (1, 2), &Device::Cpu).unwrap();
+        assert_eq!(
+            to_pcm_stream_chunk_with_normalizer(&good, &mut normalizer).unwrap(),
+            vec![3277, -3277]
+        );
     }
 }
