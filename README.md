@@ -121,11 +121,15 @@ fn main() -> anyhow::Result<()> {
 
 ### Streaming PCM
 
+The iterator yields mono `i16` samples. Use `gen.sample_rate()` to configure the
+audio sink for the loaded checkpoint.
+
 ```rust
+let sample_rate = gen.sample_rate();
 let config = VoxCPMGenerationConfig::simple();
 for chunk in gen.generate_pcm_stream_with_config("Hello.".into(), config)? {
     let pcm: Vec<i16> = chunk?;
-    // feed pcm to your audio sink
+    // Feed pcm to your audio sink at sample_rate Hz.
 }
 ```
 
@@ -145,10 +149,11 @@ patches are speech, and they seed the VAE prefix).
 Long replies are synthesized segment by segment.
 
 - With a clone cache, every segment uses the original selected reference.
-- Without a reference, the first naturally completed, acoustically checked segment
-  may provide a fixed prefix within the current request. Complete text stays paired
-  with complete audio; eligible clips are 0.5–18 seconds with at least eight
-  alphanumeric characters. Later output leaves this prefix unchanged.
+- Without a reference, the first eligible segment can supply a fixed prefix for
+  the request. The iterator must finish at the model's stop head. Pass the full
+  segment text and the complete PCM at `gen.sample_rate()`. Eligible segments
+  contain 0.5–18 seconds of audio and at least eight alphanumeric characters.
+  `ctx.is_continued()` reports whether a prefix has been accepted.
 - Callers keep context request-local and discard it on failure/cancellation.
   Generated audio always remains separate from the selected reference voice.
 
@@ -174,13 +179,10 @@ for segment in ["第一句比较长，说完自然停顿。", "第二句接着�
 
 Notes:
 
-- `update_stream_context` must run only after the stream iterator is fully
-  dropped (it encodes the complete admitted segment on the same generator).
-- The prompt features are rebuilt in memory (`build_prompt_cache_from_pcm` on
-  `VoxCPMModel`) — no WAV disk round-trip.
-- Sharing one `StreamPcmNormalizer` across the calls (as above) additionally
-  keeps PCM gain continuous; the context replaces nothing about the
-  normalizer, they compose.
+- After fully consuming the iterator, call `update_stream_context` on the same
+  generator. It builds the prompt features directly from the buffered PCM.
+- Share one `StreamPcmNormalizer` across segments to maintain the running gain.
+  Create a fresh context and normalizer for each request.
 
 ## Configuration
 
@@ -193,7 +195,8 @@ Notes:
 | `quant` | `VoxCPMQuantConfig` (weight mode + skip patterns) |
 | `seed` | Fixed RNG seed for reproducible GPU generation |
 
-Compute dtype is resolved internally (no user-facing option): **quantized runs use F32 activations** — `QMatMul` accumulates in F32, so half-precision activations only add per-layer cast kernels (measured ~3% RTF slower on Apple Silicon) — while dense runs (`quant=none`) keep the checkpoint's half precision (BF16) so weight streaming stays cheap. Use `q8_0` for throughput.
+Quantized runs use **F32 activations**. Dense runs on Metal load BF16 checkpoints
+as **F16**. See [Dtype with quant](#dtype-with-quant) for measured performance.
 
 Q8/K-quant policies keep embeddings, stop/FSQ layers, and six small conditioning/output bridges in full precision: `enc_to_lm_proj`, `lm_to_dit_proj`, `res_to_dit_proj`, and DiT estimator `in_proj` / `cond_proj` / `out_proj`. The large LM, encoder, and DiT matrices remain quantized. This improved 12-step correlation to dense FP from **0.9922 → 0.9961** on the fixed-seed M4 Pro fixture (246 quantized matrices, 10 skipped).
 
@@ -224,9 +227,9 @@ Quantization applies at load time to eligible linear layers via Candle `QTensor`
 
 ### Layer policy
 
-**Quantized:** LM / residual LM / feature encoder / DiT linear layers (fused QKV + gate/up when enabled, plus `o_proj` / `down_proj` and bridge projections).
+**Quantized:** LM, residual LM, feature encoder, and DiT linear layers eligible under the selected policy, including fused QKV and gate/up projections when enabled.
 
-**Always FP:** `embed_tokens`, `stop_head`, `stop_proj`, `fsq_layer`, **Audio VAE**.
+**Full precision:** embeddings, stop and FSQ layers, Audio VAE, and the six conditioning and output bridges listed under [Load-time options](#load-time-options-voxcpmgeneratoroptions).
 
 K-quants use block size 256; layers whose input dim is not divisible by 256 may fall back to `q8_0`. Inspect load output:
 
@@ -297,7 +300,7 @@ Emits `VOXCPM_BENCH_JSON`, per-run `VOXCPM_RUN_JSON`, `VOXCPM_QUANT_JSON`, and `
 
 ## Metal inference optimizations
 
-The 2026-10-04 M4 Pro controlled run measured 10-step RTF **0.766 → 0.738** with the new activation fusions (3.7% less wall time, PCM correlation ≥0.9999999993). The new **12-step** default with FP bridges measured RTF **0.833**; all 21 quality-fixture runs stayed below 1 (worst **0.922**). These are warmed Metal measurements; cold load and other hardware require separate checks. [Detailed experiment log](../../docs/voxcpm2_rtf_baseline.md#2026-10-04-fused-activations-and-12-step-preset).
+The 2026-10-04 M4 Pro run measured 10-step RTF **0.766 → 0.738** with the activation fusions (3.7% less wall time, PCM correlation ≥0.9999999993). The **12-step** default with FP bridges measured RTF **0.833**, and all 21 quality-fixture runs stayed below 1 (worst **0.922**). These are warmed Metal measurements. [Detailed experiment log](https://github.com/bailu-obj/bailu/blob/78c49626de96592f829c974309a8d78f0bb9fa47/docs/voxcpm2_rtf_baseline.md#2026-10-04-fused-activations-and-12-step-preset)
 
 VoxCPM2 DiT/LM inference is **launch-overhead-bound** on Metal (many tiny kernels per Euler step), not weight-bandwidth-bound. Defaults cut dispatches without changing math:
 
@@ -378,7 +381,7 @@ Re-exported from the crate root:
 Unit tests run on CPU without model files:
 
 ```bash
-cargo test -p voxcpm-rs
+cargo test --release -p voxcpm-rs --lib
 ```
 
 Doc tests and GPU examples require downloaded weights and a GPU build; exclude this crate (`--exclude voxcpm-rs`) in CI smoke tests without a GPU. The ignored GPU tests (`-- --ignored --nocapture`, `VOXCPM2_MODEL_PATH=...`) run dense-F16 on Metal via the load-time downcast: `voxcpm2_smoke` (3 tests) and `stream_batch_parity` pass on Apple Silicon with correlation ≥ 0.9996.
