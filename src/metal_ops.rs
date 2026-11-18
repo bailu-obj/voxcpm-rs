@@ -1,7 +1,7 @@
 //! Inference-only Metal fusion for transformer and VAE activations.
 
 use candle_core::{
-    CpuStorage, CustomOp1, CustomOp3, DType, Layout, MetalStorage, Shape, backend::BackendStorage,
+    backend::BackendStorage, CpuStorage, CustomOp1, CustomOp3, DType, Layout, MetalStorage, Shape,
 };
 use candle_metal_kernels::metal::{ComputePipeline, Device};
 use objc2_metal::{MTLResourceUsage, MTLSize};

@@ -1,4 +1,4 @@
-use anyhow::{Ok, Result, anyhow};
+use anyhow::{anyhow, Ok, Result};
 use std::collections::HashMap;
 use tokenizers::Tokenizer;
 

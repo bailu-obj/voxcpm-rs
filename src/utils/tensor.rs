@@ -1,5 +1,5 @@
-use anyhow::{Result, anyhow};
-use candle_core::{D, DType, Device, IndexOp, Tensor, shape::Dim};
+use anyhow::{anyhow, Result};
+use candle_core::{shape::Dim, DType, Device, IndexOp, Tensor, D};
 use candle_nn::ops::sigmoid;
 
 pub fn prepare_causal_attention_mask(

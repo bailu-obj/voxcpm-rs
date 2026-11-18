@@ -3,16 +3,16 @@
 //! Quality fixtures (`--quality-matrix`) cover short interjections, the Paimon chat line,
 //! and short/medium/long prose for stop-schedule / long-text A/B.
 
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use clap::Parser;
 use std::path::PathBuf;
 use std::time::Instant;
 use voxcpm_rs::{
-    BenchmarkMetrics, COMPARE_FP_DEFAULT_SEED, QuantStats, StageProfile, VoxCPMGenerationConfig,
+    audio_quality_ok, bench_profile_enabled, bottleneck_hint, compare_fp_enabled,
+    compare_fp_min_correlation, pcm_correlation, reset_stage_profile, take_stage_profile,
+    BenchmarkMetrics, QuantStats, StageProfile, VoxCPMGenerationConfig,
     VoxCPMGenerationDiagnostics, VoxCPMGenerator, VoxCPMGeneratorOptions, VoxCPMQuantConfig,
-    VoxCPMWeightQuant, audio_quality_ok, bench_profile_enabled, bottleneck_hint,
-    compare_fp_enabled, compare_fp_min_correlation, pcm_correlation, reset_stage_profile,
-    take_stage_profile,
+    VoxCPMWeightQuant, COMPARE_FP_DEFAULT_SEED,
 };
 
 /// Deterministic quality fixtures for stop / interjection / long-text A/B.

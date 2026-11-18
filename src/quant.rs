@@ -396,9 +396,7 @@ mod tests {
                 "conditioning bridge must stay FP: {path}"
             );
         }
-        assert!(
-            !cfg.should_skip_module("feat_decoder.estimator.decoder.layers.0.self_attn.q_proj")
-        );
+        assert!(!cfg.should_skip_module("feat_decoder.estimator.decoder.layers.0.self_attn.q_proj"));
         assert!(!cfg.should_skip_module("feat_decoder.estimator.decoder.layers.0.mlp.down_proj"));
     }
 

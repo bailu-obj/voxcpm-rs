@@ -4,7 +4,7 @@
 //! `VOXCPM2_MODEL_PATH=models/VoxCPM-0.5B cargo test -p voxcpm-rs --test stream_batch_parity -- --ignored --nocapture`
 
 use voxcpm_rs::profile::pcm_correlation;
-use voxcpm_rs::{COMPARE_FP_DEFAULT_SEED, VoxCPMGenerationConfig, VoxCPMGenerator};
+use voxcpm_rs::{VoxCPMGenerationConfig, VoxCPMGenerator, COMPARE_FP_DEFAULT_SEED};
 use voxcpm_rs::{VoxCPMGeneratorOptions, VoxCPMQuantConfig, VoxCPMWeightQuant};
 
 const ONSET_SAMPLES: usize = 96_000; // 2 s @ 48 kHz

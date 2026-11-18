@@ -1,5 +1,5 @@
 use anyhow::Result;
-use candle_core::{D, DType, Device, IndexOp, Tensor};
+use candle_core::{DType, Device, IndexOp, Tensor, D};
 use candle_nn::{Module, VarBuilder};
 use std::{
     cmp::max,
@@ -11,9 +11,9 @@ use crate::{
     audio_vae::AudioVAE,
     config::{CfmConfig, VoxCPMConfig, VoxMiniCPM4Config},
     generate::{VoxCPMGenerationConfig, VoxCPMGenerationDiagnostics, VoxCPMStopReason},
-    linear::{LinearX, linear_x},
+    linear::{linear_x, LinearX},
     minicpm4::MiniCPMModel,
-    profile::{InferenceStepProfile, StageProfile, profile_stream_enabled, stage_capture_enabled},
+    profile::{profile_stream_enabled, stage_capture_enabled, InferenceStepProfile, StageProfile},
     quant::{QuantBuildCtx, QuantStats, VoxCPMQuantConfig},
     tokenizer::SingleChineseTokenizer,
     utils::audio::load_audio_with_resample,
